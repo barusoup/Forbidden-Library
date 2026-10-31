@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forbidden Library</title>
+  <meta name="description" content="Forbidden Library is a local photo and video library for Windows. Import, browse, and search everything on your own machine.">
+  <link rel="icon" type="image/png" href="assets/app-icon.png">
+  <link rel="stylesheet" href="styles.css?v=29">
+</head>
+<body>
+  <svg class="sketch-defs" aria-hidden="true" focusable="false">
+    <filter id="sketch">
+      <feTurbulence type="fractalNoise" baseFrequency="0.04" numOctaves="2" seed="7"/>
+      <feDisplacementMap in="SourceGraphic" scale="3"/>
+    </filter>
+  </svg>
+
+  <header class="site-header">
+    <a class="brand" href="#top">
+      <span>Forbidden Library</span>
+    </a>
+    <nav>
+      <a class="github" href="https://github.com/barusoup/Forbidden-Library" aria-label="Forbidden Library on GitHub">
+        <img src="assets/github-mark.png?v=21" alt="" width="30" height="30">
+      </a>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="about">
+      <p class="tagline">Local media archival tool with optional encryption and efficient file storage</p>
+
+      <dl class="formats">
+        <div>
+          <dt>Photos</dt>
+          <dd>JPEG, PNG, GIF, WebP, HEIC, AVIF, JPEG XL, TIFF, BMP, DNG, CR2, NEF, ARW</dd>
+        </div>
+        <div>
+          <dt>Video</dt>
+          <dd>MP4, MOV, M4V, MKV, WebM, AVI, WMV, MPEG, M2TS, 3GP, FLV</dd>
+        </div>
+        <div>
+          <dt>Audio</dt>
+          <dd>MP3, M4A, AAC, FLAC, WAV, AIFF, OGG, Opus, WMA, APE</dd>
+        </div>
+      </dl>
+
+      <p class="written">Written in Rust, made with <a href="https://github.com/barusoup/Dream">Dream</a></p>
+    </section>
+
+    <section class="hero">
+      <a class="download" id="download" href="https://github.com/barusoup/Forbidden-Library/releases/latest">
+        <span class="label">
+          <svg class="win-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <!-- Windows logo: Simple Icons "windows" (CC0 1.0), https://simpleicons.org -->
+            <path d="M0,0H11.377V11.372H0ZM12.623,0H24V11.372H12.623ZM0,12.623H11.377V24H0Zm12.623,0H24V24H12.623"/>
+          </svg>
+          <span>Install for Windows</span>
+        </span>
+        <span class="arch" id="arch">x64</span>
+      </a>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>
+      Open source under the <a href="https://github.com/barusoup/Forbidden-Library/blob/main/LICENSE">AGPL-3.0 with attribution terms</a> ·
+      <a href="https://github.com/barusoup/Forbidden-Library#readme">Read more on GitHub</a> ·
+      <a href="https://github.com/barusoup/Forbidden-Library/blob/main/THIRD_PARTY.md">Third-party notices</a>
+    </p>
+  </footer>
+
+  <script>
+    // Point the button at the newest installer and show its version. Falls back
+    // to the releases page and a plain "x64" label if GitHub cannot be reached.
+    (async function () {
+      const repo = "barusoup/Forbidden-Library";
+      try {
+        const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, {
+          headers: { Accept: "application/vnd.github+json" }
+        });
+        if (!res.ok) return;
+        const release = await res.json();
+        const setup = (release.assets || []).find(a => /^ForbiddenLibrarySetup-.*\.exe$/i.test(a.name));
+        if (!setup) return;
+        const button = document.getElementById("download");
+        button.href = setup.browser_download_url;
+        button.setAttribute("download", setup.name);
+        const version = setup.name.replace(/^ForbiddenLibrarySetup-/i, "").replace(/\.exe$/i, "");
+        document.getElementById("arch").textContent = `x64-${version}`;
+      } catch (err) {
+        // Keep the fallback link and label.
+      }
+    })();
+  </script>
+</body>
+</html>

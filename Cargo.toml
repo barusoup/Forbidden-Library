@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/archive-core", "crates/forbidden-library"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+authors = ["Forbidden Library"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+
+# Password derivation is deliberately expensive. Built unoptimised, one unlock
+# takes long enough to make the lock tests unusable, so these crates are always
+# optimised, in debug builds too. Release builds are unaffected.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.chacha20poly1305]
+opt-level = 3

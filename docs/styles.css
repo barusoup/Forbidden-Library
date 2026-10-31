@@ -1,0 +1,225 @@
+:root {
+  --paper: #ffffff;
+  --ink: #111111;
+  --button: #d9d9d9;
+  --button-tint: #e8e8e8;
+  --button-hover: #c4c4c4;
+  --muted: #555555;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; }
+
+body {
+  font-family: "Segoe Print", "Bradley Hand", "Comic Sans MS", cursive;
+  background: var(--paper);
+  color: var(--ink);
+  line-height: 1.4;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+a { color: inherit; }
+
+/* Hidden SVG that holds the wobble filters. */
+.sketch-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem clamp(1.25rem, 5vw, 3rem);
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 1.25rem;
+  text-decoration: none;
+}
+
+/* Small version of the install button: same grey fill, outline and shadow. */
+.github {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.8rem;
+  height: 2.8rem;
+  transition: transform 0.15s ease;
+}
+
+/* The wobbly face sits behind the mark, so the mark itself stays crisp. */
+.github::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--button);
+  border: 2px solid var(--ink);
+  border-radius: 255px 12px 225px 10px / 10px 225px 12px 255px;
+  box-shadow: 3px 3px 0 var(--ink);
+  filter: url(#sketch);
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* The mark is a 30x30 pixel image shown at exactly one screen pixel per cell. */
+.github img {
+  width: 30px;
+  height: 30px;
+  image-rendering: pixelated;
+}
+
+.github:hover::before {
+  background: var(--button-tint);
+}
+
+.github:active {
+  transform: translate(2px, 2px);
+}
+
+.github:active::before {
+  background: var(--button-hover);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
+.github:focus-visible {
+  outline: 2px dashed var(--ink);
+  outline-offset: 4px;
+}
+
+main {
+  flex: 1;
+}
+
+.hero {
+  display: flex;
+  justify-content: center;
+  padding: 4.5rem 1.5rem 3rem;
+}
+
+.about {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 5rem 1.5rem 1rem;
+  text-align: center;
+}
+
+.tagline {
+  font-size: 1.25rem;
+  margin: 0 0 2.5rem;
+}
+
+/* Two columns: the media type on the left, its formats on the right. */
+.formats {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.7rem 1.25rem;
+  max-width: 36rem;
+  margin: 0 auto 3rem;
+  text-align: left;
+}
+
+.formats > div {
+  display: contents;
+}
+
+.formats dt {
+  font-weight: 700;
+  text-align: right;
+}
+
+.formats dd {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--ink);
+}
+
+.written {
+  margin: 0;
+  color: var(--muted);
+}
+
+/* Irregular corner radii give the button a hand-drawn outline. */
+.download {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 1rem 2.25rem;
+  background: var(--button);
+  color: var(--ink);
+  border: 3px solid var(--ink);
+  border-radius: 255px 18px 225px 16px / 16px 225px 18px 255px;
+  box-shadow: 5px 5px 0 var(--ink);
+  text-decoration: none;
+  filter: url(#sketch);
+  transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+/* Hover only tints; the press (click) gives the shift and shadow change. */
+.download:hover {
+  background: var(--button-tint);
+}
+
+.download:active {
+  background: var(--button-hover);
+  transform: translate(2px, 2px);
+  box-shadow: 3px 3px 0 var(--ink);
+}
+
+.download:focus-visible {
+  outline: 2px dashed var(--ink);
+  outline-offset: 6px;
+}
+
+.label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 1.4rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.win-icon {
+  width: 1.2rem;
+  height: 1.2rem;
+  fill: currentColor;
+  filter: url(#sketch);
+}
+
+.arch {
+  font-size: 1rem;
+  color: var(--muted);
+}
+
+.site-footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 1rem;
+  padding: 1rem 1.5rem 1.5rem;
+}
+
+.site-footer a {
+  text-underline-offset: 3px;
+}
+
+/* Text links only shift colour on hover, with no box behind them. The buttons
+   handle their own hover, so they are left out. */
+a:not(.download):not(.github) {
+  transition: color 0.15s ease;
+}
+
+a:not(.download):not(.github):hover {
+  color: var(--ink);
+}

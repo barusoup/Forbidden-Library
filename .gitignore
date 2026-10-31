@@ -1,0 +1,32 @@
+# Build output
+/target/
+/dist/
+
+# Downloaded tools. Both folders are produced by scripts/package.ps1 and the
+# fetch scripts; they are never edited by hand and the binaries are large.
+/assets/ffmpeg/ffmpeg.exe
+/assets/ffmpeg/ffprobe.exe
+/assets/jxl/cjxl.exe
+/assets/jxl/djxl.exe
+/vendor/ffmpeg/
+/vendor/semantic/
+
+# Runtime state and logs
+/logs/
+*.log
+*.pdb
+
+# Staging and archives produced locally
+*.zip
+*.tmp
+*.stage
+
+# Windows and editor litter
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Personal tooling notes
+/AGENTS.md
+/CLAUDE.md
+/.claude/
