@@ -56,7 +56,22 @@ struct Host {
     /// Set when a rendercheck step fails, so the process exits non-zero.
     rendercheck_failed: bool,
     sources: Vec<PathBuf>,
+    /// The window is fully covered by other windows (platforms that report it).
+    occluded: bool,
+    /// The hidden state last acted on, so a hide or show is handled once.
+    hidden_applied: bool,
+    /// When the last frame was drawn, for pacing the next one.
+    last_render: Instant,
+    /// The monitor's refresh period and when it was read.
+    refresh: Option<(Instant, Duration)>,
+    /// When to return the working set to the OS: after warm-up and quiet spells.
+    memory: dream::memory::IdleTrim,
 }
+
+/// The fastest the UI animates. A high-refresh monitor would otherwise ask for
+/// several times the frames of a 60 Hz one for the same motion; 120 Hz is
+/// already past what UI motion needs.
+const MOTION_FPS: f32 = 120.0;
 
 impl Host {
     fn new(proxy: EventLoopProxy<()>, rendercheck: bool, sources: Vec<PathBuf>) -> Self {
@@ -70,7 +85,65 @@ impl Host {
             rendercheck,
             rendercheck_failed: false,
             sources,
+            occluded: false,
+            hidden_applied: false,
+            last_render: Instant::now(),
+            refresh: None,
+            memory: dream::memory::IdleTrim::new(),
         }
+    }
+
+    /// Minimised or fully covered: nothing drawn could be seen.
+    fn hidden(&self) -> bool {
+        self.occluded
+            || self
+                .window
+                .as_ref()
+                .and_then(|window| window.is_minimized())
+                .unwrap_or(false)
+    }
+
+    /// Act on a hide or show once. A hidden window draws nothing, so the
+    /// renderer's idle buffers and the process's cold pages go back now.
+    fn apply_hidden(&mut self, hidden: bool) {
+        if self.hidden_applied == hidden {
+            return;
+        }
+        self.hidden_applied = hidden;
+        if hidden {
+            if let Some(renderer) = self.app.as_mut().and_then(|app| app.renderer.as_mut()) {
+                renderer.release_scene_resources();
+                renderer.trim_memory();
+            }
+            dream::memory::trim_working_set();
+            self.memory = dream::memory::IdleTrim::new();
+        } else {
+            self.request_redraw();
+        }
+    }
+
+    /// Time between frames while something moves: one per refresh of the
+    /// window's monitor, capped at [`MOTION_FPS`]. Pacing in software, rather
+    /// than letting the swapchain block, keeps some drivers from busy-waiting a
+    /// whole core inside the present wait.
+    fn frame_period(&mut self, now: Instant) -> Duration {
+        if let Some((read, period)) = self.refresh
+            && now.duration_since(read) < Duration::from_millis(500)
+        {
+            return period;
+        }
+        let hz = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor())
+            .and_then(|monitor| monitor.refresh_rate_millihertz())
+            .map(|millihertz| millihertz as f32 / 1000.0)
+            .filter(|hz| hz.is_finite() && *hz > 1.0)
+            .unwrap_or(60.0)
+            .min(MOTION_FPS);
+        let period = Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0));
+        self.refresh = Some((now, period));
+        period
     }
 
     fn request_redraw(&self) {
@@ -93,6 +166,11 @@ impl Host {
 
     fn run_rendercheck(&mut self, event_loop: &ActiveEventLoop) {
         let Some(app) = self.app.as_mut() else { return };
+        // Frames go straight to the swapchain unless capture is on, and the
+        // check reads them back.
+        if let Some(renderer) = app.renderer.as_mut() {
+            renderer.set_frame_capture(true);
+        }
         let report = archive_core::import_paths(
             &app.library,
             &self.sources,
@@ -281,6 +359,8 @@ impl ApplicationHandler for Host {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Read before `app` borrows `self` for the rest of the handler.
+        let hidden = self.hidden();
         let Some(app) = self.app.as_mut() else {
             return;
         };
@@ -304,12 +384,21 @@ impl ApplicationHandler for Host {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
-                app.render(Instant::now());
-                let wants = app.wants_frame();
-                self.update_cursor();
-                if wants {
-                    self.request_redraw();
+                let now = Instant::now();
+                if hidden {
+                    // Nothing can be seen: keep the timers honest, draw nothing.
+                    app.idle_tick(now);
+                    return;
                 }
+                app.render(now);
+                self.last_render = now;
+                self.memory.activity(now);
+                // The next frame, if one is wanted, is scheduled in
+                // `about_to_wait`, paced to the display.
+                self.update_cursor();
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
             }
             WindowEvent::Resized(size) => {
                 // Minimised (or otherwise zero-sized) windows have nothing to
@@ -410,6 +499,25 @@ impl ApplicationHandler for Host {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        let hidden = self.hidden();
+        self.apply_hidden(hidden);
+        if hidden {
+            // Only the unlocked-collection timer matters while hidden; video
+            // and animation wait for the window to show again.
+            if let Some(app) = self.app.as_mut() {
+                if app.hidden_wake().is_some_and(|at| at <= now) {
+                    app.idle_tick(now);
+                }
+                match app.hidden_wake() {
+                    Some(at) if at > now => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+                    _ => event_loop.set_control_flow(ControlFlow::Wait),
+                }
+            }
+            return;
+        }
+        if self.memory.trim_if_due(now) {
+            dream::memory::trim_working_set();
+        }
         let mut drop_due = None;
         if let Some(last) = self.last_drop {
             let due = last + Duration::from_millis(150);
@@ -437,11 +545,21 @@ impl ApplicationHandler for Host {
             return;
         }
         if wants {
-            self.request_redraw();
+            let due = self.last_render + self.frame_period(now);
+            if now >= due {
+                self.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+            }
             return;
         }
-        match wake {
-            Some(at) if at <= now => self.request_redraw(),
+        if wake.is_some_and(|at| at <= now) {
+            self.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        match wake.into_iter().chain(self.memory.next_deadline()).min() {
             Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }

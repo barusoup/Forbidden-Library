@@ -35,7 +35,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 cpal = "0.16"
 dirs = "6"
 getrandom = "0.3"
-dream = { git = "https://github.com/barusoup/Dream", rev = "3b27f79a7f65f5773f31512e986e65a5c6b180cf" }
+dream = { git = "https://github.com/barusoup/Dream", rev = "92903b88e387c2ebdaa036ffe6ec07aa81598090" }
 raw-window-handle = "0.6"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }

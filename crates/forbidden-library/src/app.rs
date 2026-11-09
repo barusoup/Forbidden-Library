@@ -123,6 +123,10 @@ enum EmptyKind {
 /// Idle time after which every unlocked collection locks itself. Input inside
 /// the window resets it; looking at a picture inside a collection holds it off.
 const VAULT_IDLE: Duration = Duration::from_secs(60);
+/// One caret blink cycle of the search field, in seconds, and how long of it
+/// the caret is shown.
+const CARET_PERIOD: f32 = 1.06;
+const CARET_ON: f32 = 0.58;
 
 /// Stiffness of the chrome springs. Critically damped, so the island and the
 /// header land together in about a fifth of a second.
@@ -863,6 +867,8 @@ pub struct ArchiveApp {
     pub input: Input,
     pub dirty: bool,
     last_frame: Instant,
+    /// Seconds since the previous frame, unclamped (see `render`).
+    frame_real_dt: f32,
     time: f32,
     frame_dt: f32,
     animating: bool,
@@ -1026,6 +1032,7 @@ impl ArchiveApp {
             input: Input::default(),
             dirty: true,
             last_frame: Instant::now(),
+            frame_real_dt: 0.0,
             time: 0.0,
             frame_dt: 0.0,
             animating: false,
@@ -1160,6 +1167,7 @@ impl ArchiveApp {
             input: Input::default(),
             dirty: true,
             last_frame: Instant::now(),
+            frame_real_dt: 0.0,
             time: 0.0,
             frame_dt: 0.0,
             animating: false,
@@ -2721,7 +2729,9 @@ impl ArchiveApp {
         let busy = self.search_busy();
         self.search_wait = if busy { self.search_wait + dt } else { 0.0 };
         if self.search_focus {
-            self.search_blink += dt;
+            // Real time, not the clamped animation step: the caret is woken
+            // twice a second, and a clamped step would slow the blink down.
+            self.search_blink += self.frame_real_dt;
         }
         if self.search_pending {
             self.search_debounce -= dt;
@@ -2739,6 +2749,33 @@ impl ArchiveApp {
         self.drain_events();
     }
 
+    /// When the caret next turns on or off, while the search field is focused.
+    /// The blink is driven by these wakes instead of a frame every refresh, so
+    /// a focused field costs two frames a second rather than a continuous loop.
+    fn caret_wake(&self) -> Option<Instant> {
+        if !self.search_focus {
+            return None;
+        }
+        let phase = self.search_blink % CARET_PERIOD;
+        let left = if phase < CARET_ON {
+            CARET_ON - phase
+        } else {
+            CARET_PERIOD - phase
+        };
+        Some(self.last_frame + Duration::from_secs_f32(left.max(0.001)))
+    }
+
+    /// Work that must happen even when no frame is drawn (the window is
+    /// minimised or covered): unlocked collections still lock on time.
+    pub fn idle_tick(&mut self, now: Instant) {
+        self.vault_idle_check(now);
+    }
+
+    /// The only wake a hidden window needs: the unlocked-collection timer.
+    pub fn hidden_wake(&self) -> Option<Instant> {
+        self.vault_wake()
+    }
+
     pub fn wants_frame(&self) -> bool {
         if self.dirty {
             return true;
@@ -2749,8 +2786,9 @@ impl ArchiveApp {
         if self.viewer_animating() {
             return true;
         }
-        if self.modal.is_some() || self.toast.is_some() || self.search_focus || self.search_pending
-        {
+        // A focused search field is not here: its caret blinks on the wakes
+        // from `caret_wake`.
+        if self.modal.is_some() || self.toast.is_some() || self.search_pending {
             return true;
         }
         // A menu that is fading out needs frames until it is gone.
@@ -2819,10 +2857,8 @@ impl ArchiveApp {
     }
 
     pub fn render(&mut self, now: Instant) {
-        let dt = now
-            .saturating_duration_since(self.last_frame)
-            .as_secs_f32()
-            .clamp(0.0, 0.05);
+        self.frame_real_dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
+        let dt = self.frame_real_dt.clamp(0.0, 0.05);
         self.last_frame = now;
         self.advance_viewer(now);
         self.vault_idle_check(now);
@@ -2837,7 +2873,12 @@ impl ArchiveApp {
                 // It is still owed: keep asking for frames, or the UI stays
                 // on the last picture until the next input event.
                 Err(dream::gfx::SurfaceError::Timeout) => self.dirty = true,
-                Err(dream::gfx::SurfaceError::Outdated) => {}
+                // The surface changed size or format under the swapchain:
+                // rebuild it and draw again.
+                Err(dream::gfx::SurfaceError::Outdated) => {
+                    renderer.recreate_swapchain();
+                    self.dirty = true;
+                }
                 Err(error) => {
                     self.last_error = Some(format!("{error:?}"));
                 }
@@ -4703,7 +4744,7 @@ impl ArchiveApp {
                 );
                 caret_x = text_x + text_width.min(avail) - shift + 1.0;
             }
-            if self.search_focus && self.search_blink % 1.06 < 0.58 {
+            if self.search_focus && self.search_blink % CARET_PERIOD < CARET_ON {
                 ui.paint_round_rect(
                     Rect::new(caret_x, field.y + 10.0, 1.5, 20.0),
                     0.75,
@@ -6336,10 +6377,10 @@ impl ArchiveApp {
     /// the earliest of the players' own schedules, the full decode's
     /// debounce, and the video bar's auto-hide.
     pub fn next_wake(&self, now: Instant) -> Option<Instant> {
-        match (self.vault_wake(), self.viewer_wake(now)) {
-            (Some(vault), Some(viewer)) => Some(vault.min(viewer)),
-            (vault, viewer) => vault.or(viewer),
-        }
+        [self.vault_wake(), self.viewer_wake(now), self.caret_wake()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     fn viewer_wake(&self, now: Instant) -> Option<Instant> {

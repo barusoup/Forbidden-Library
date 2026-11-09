@@ -1219,7 +1219,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 [[package]]
 name = "dream"
 version = "0.1.0"
-source = "git+https://github.com/barusoup/Dream?rev=3b27f79a7f65f5773f31512e986e65a5c6b180cf#3b27f79a7f65f5773f31512e986e65a5c6b180cf"
+source = "git+https://github.com/barusoup/Dream?rev=92903b88e387c2ebdaa036ffe6ec07aa81598090#92903b88e387c2ebdaa036ffe6ec07aa81598090"
 dependencies = [
  "ash",
  "ash-window",
