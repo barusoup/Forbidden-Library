@@ -43,6 +43,9 @@ pub enum AppIcon {
     Music,
     Lock,
     LockOpen,
+    Settings,
+    Pencil,
+    Tag,
 }
 
 /// The Lucide slug, used as the atlas cache key and for provenance.
@@ -80,6 +83,9 @@ pub fn slug(icon: AppIcon) -> &'static str {
         AppIcon::Music => "music",
         AppIcon::Lock => "lock",
         AppIcon::LockOpen => "lock-open",
+        AppIcon::Settings => "settings",
+        AppIcon::Pencil => "pencil",
+        AppIcon::Tag => "tag",
     }
 }
 
@@ -205,6 +211,22 @@ fn paths(icon: AppIcon) -> &'static [&'static str] {
             "M5.0 11.0H19.0A2.0 2.0 0 0 1 21.0 13.0V20.0A2.0 2.0 0 0 1 19.0 22.0H5.0A2.0 2.0 0 0 1 3.0 20.0V13.0A2.0 2.0 0 0 1 5.0 11.0Z",
             "M7 11V7a5 5 0 0 1 9.9-1",
         ],
+        // Lucide `settings` (0.544.0): the gear outline, and its hub circle
+        // written as an arc.
+        AppIcon::Settings => &[
+            "M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915",
+            "M9 12a3 3 0 1 0 6 0a3 3 0 1 0 -6 0",
+        ],
+        // Lucide `pencil` (0.544.0): the nib outline and the line along its side.
+        AppIcon::Pencil => &[
+            "M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z",
+            "m15 5 4 4",
+        ],
+        // Lucide `tag` (0.544.0, ISC): the tag outline and its pinhole.
+        AppIcon::Tag => &[
+            "M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94.94-2.48 0-3.42L12 2Z",
+            "M7 7h.01",
+        ],
     }
 }
 
@@ -298,6 +320,8 @@ mod tests {
             AppIcon::LoaderCircle,
             AppIcon::Lock,
             AppIcon::LockOpen,
+            AppIcon::Settings,
+            AppIcon::Pencil,
         ] {
             assert!(!paths(icon).is_empty(), "{} has no paths", slug(icon));
         }

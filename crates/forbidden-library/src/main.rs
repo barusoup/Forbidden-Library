@@ -189,6 +189,7 @@ impl Host {
             app::Page::Albums,
             app::Page::Collections,
             app::Page::Trash,
+            app::Page::Settings,
         ];
         let mut checked = Vec::new();
         for page in pages {

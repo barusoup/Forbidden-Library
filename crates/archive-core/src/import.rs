@@ -7,6 +7,7 @@ use crate::lyrics;
 use crate::model::{ImportReport, Item, Kind, OptState, ThumbState};
 use crate::optimize::{self, OptimizeConfig};
 use crate::probe;
+use crate::sealed;
 use crate::store;
 use crate::thumb;
 use crate::time;
@@ -312,7 +313,7 @@ pub fn import_paths(
                     if item.kind == Kind::Audio {
                         // The cover is the preview. A file without one is still
                         // music, so it is kept and its tile is drawn without art.
-                        let source = library.paths().abs(&item.rel_path);
+                        let source = item.rel_path.clone();
                         match thumb::generate(
                             library.paths(),
                             &item.id,
@@ -332,7 +333,7 @@ pub fn import_paths(
                             Err(_) => item.thumb_state = ThumbState::None,
                         }
                     } else if matches!(item.kind, Kind::Image | Kind::Video) {
-                        let source = library.paths().abs(&item.rel_path);
+                        let source = item.rel_path.clone();
                         let generated = if forced_preview_failure(&path) {
                             Err(Error::msg("the preview was forced to fail"))
                         } else {
@@ -779,7 +780,7 @@ fn import_one(
     };
 
     let mut last_report = 0u64;
-    let mut staged = store::stage_copy(path, library.paths().tmp(), |copied| {
+    let mut staged = store::stage_copy(library.paths(), path, |copied| {
         if copied - last_report >= 4 * 1024 * 1024 {
             last_report = copied;
             progress(copied, bytes);
@@ -825,27 +826,36 @@ fn import_one(
     if let Some(config) = &options.optimize
         && optimize::is_candidate(info.kind, &source_ext, staged.bytes)
     {
-        match optimize::best_replacement(
-            &staged.tmp,
-            &source_ext,
-            library.paths().tmp(),
-            tools,
-            config,
-        ) {
-            Ok(Some(replacement)) => match store::replace_staged(&staged, &replacement.path) {
-                Ok(next) => {
-                    staged = next;
-                    ext = replacement.ext;
-                    mime = replacement.mime;
-                    opt_state = OptState::Optimized;
-                    opt_kind = Some(replacement.kind.to_string());
+        // The encoders read a plain file, so they get a decrypted copy of
+        // the staged one, which goes once they have finished.
+        let plain = sealed::plain_of(library.paths(), &staged.tmp, &source_ext);
+        let outcome = match &plain {
+            Ok(plain) => optimize::best_replacement(
+                plain.path(),
+                &source_ext,
+                library.paths().tmp(),
+                tools,
+                config,
+            ),
+            Err(error) => Err(Error::Msg(error.to_string())),
+        };
+        match outcome {
+            Ok(Some(replacement)) => {
+                match store::replace_staged(library.paths(), &staged, &replacement.path) {
+                    Ok(next) => {
+                        staged = next;
+                        ext = replacement.ext;
+                        mime = replacement.mime;
+                        opt_state = OptState::Optimized;
+                        opt_kind = Some(replacement.kind.to_string());
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&replacement.path);
+                        opt_state = OptState::Failed;
+                        opt_error = Some(error.to_string());
+                    }
                 }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&replacement.path);
-                    opt_state = OptState::Failed;
-                    opt_error = Some(error.to_string());
-                }
-            },
+            }
             // Nothing verified as smaller: the original is stored as it was.
             Ok(None) => {}
             Err(error) => {
@@ -860,27 +870,34 @@ fn import_one(
     // The item still carries the original's hash as its identity, as above.
     let mut audio = info.audio.clone();
     if let (Some(_), Some(meta)) = (&options.optimize, audio.as_mut()) {
-        match audio::optimize(tools, &staged.tmp, meta, library.paths().tmp()) {
+        let plain = sealed::plain_of(library.paths(), &staged.tmp, &source_ext);
+        let attempt = match &plain {
+            Ok(plain) => audio::optimize(tools, plain.path(), meta, library.paths().tmp()),
+            Err(error) => Attempt::Refused(error.to_string()),
+        };
+        match attempt {
             Attempt::Keep => {}
             Attempt::Refused(reason) => {
                 opt_state = OptState::Failed;
                 opt_error = Some(reason);
             }
-            Attempt::Replaced(candidate) => match store::replace_staged(&staged, &candidate.path) {
-                Ok(next) => {
-                    staged = next;
-                    ext = candidate.ext.to_string();
-                    mime = candidate.mime.to_string();
-                    opt_state = OptState::Optimized;
-                    opt_kind = Some(candidate.opt_kind.to_string());
-                    *meta = candidate.meta;
+            Attempt::Replaced(candidate) => {
+                match store::replace_staged(library.paths(), &staged, &candidate.path) {
+                    Ok(next) => {
+                        staged = next;
+                        ext = candidate.ext.to_string();
+                        mime = candidate.mime.to_string();
+                        opt_state = OptState::Optimized;
+                        opt_kind = Some(candidate.opt_kind.to_string());
+                        *meta = candidate.meta;
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&candidate.path);
+                        opt_state = OptState::Failed;
+                        opt_error = Some(error.to_string());
+                    }
                 }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&candidate.path);
-                    opt_state = OptState::Failed;
-                    opt_error = Some(error.to_string());
-                }
-            },
+            }
         }
     }
 
@@ -1063,7 +1080,7 @@ mod tests {
         let library = Library::open(temp.path().join("library")).unwrap();
         let source = temp.path().join("loose.png");
         std::fs::write(&source, png_bytes()).unwrap();
-        let staged = store::stage_copy(&source, library.paths().tmp(), |_| {}).unwrap();
+        let staged = store::stage_copy(library.paths(), &source, |_| {}).unwrap();
 
         let in_flight = InFlight::default();
         let rel = in_flight.install(&library, &staged, "png").unwrap();

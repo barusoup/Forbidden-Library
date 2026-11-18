@@ -37,30 +37,47 @@ pub fn limits() -> image::Limits {
 /// for it. Its pictures come back with the codestream's rotation applied; see
 /// [`crate::jxl::oriented_by_decoder`].
 pub fn open(path: &Path) -> Result<DynamicImage> {
+    let label = path.display().to_string();
     if crate::jxl::has_signature(path) {
         return crate::jxl::decode(path);
     }
     let mut reader = ImageReader::open(path)
-        .map_err(|error| Error::Msg(format!("open image {}: {error}", path.display())))?
+        .map_err(|error| Error::Msg(format!("open image {label}: {error}")))?
         .with_guessed_format()
-        .map_err(|error| Error::Msg(format!("identify image {}: {error}", path.display())))?;
+        .map_err(|error| Error::Msg(format!("identify image {label}: {error}")))?;
     reader.limits(limits());
     let image = reader
         .decode()
-        .map_err(|error| Error::Msg(format!("decode image {}: {error}", path.display())))?;
+        .map_err(|error| Error::Msg(format!("decode image {label}: {error}")))?;
     // The allocation limit already rejects most of these, but a format whose
     // decoder streams its rows can still report a size past the cap.
-    check_dimensions(path, image.width(), image.height())?;
+    check_dimensions(&label, image.width(), image.height())?;
+    Ok(image)
+}
+
+/// Decode an image held in memory. `label` names it in error messages. The
+/// same limits and format detection as [`open`] apply.
+pub fn open_bytes(bytes: &[u8], label: &str) -> Result<DynamicImage> {
+    if crate::jxl::is_jxl(bytes) {
+        return crate::jxl::decode_bytes(bytes, label);
+    }
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| Error::Msg(format!("identify image {label}: {error}")))?;
+    reader.limits(limits());
+    let image = reader
+        .decode()
+        .map_err(|error| Error::Msg(format!("decode image {label}: {error}")))?;
+    check_dimensions(label, image.width(), image.height())?;
     Ok(image)
 }
 
 /// Refuse a picture with more pixels than [`MAX_PIXELS`]. Decoders that can
 /// report their size first are checked before any pixel is produced.
-pub(crate) fn check_dimensions(path: &Path, width: u32, height: u32) -> Result<()> {
+pub(crate) fn check_dimensions(label: &str, width: u32, height: u32) -> Result<()> {
     if u64::from(width).saturating_mul(u64::from(height)) > MAX_PIXELS {
         return Err(Error::Msg(format!(
-            "image {} is {width}x{height}; larger than the {} megapixel limit",
-            path.display(),
+            "image {label} is {width}x{height}; larger than the {} megapixel limit",
             MAX_PIXELS / 1_000_000
         )));
     }
@@ -73,8 +90,7 @@ mod tests {
 
     #[test]
     fn a_picture_past_the_pixel_limit_is_refused_before_decoding() {
-        let path = Path::new("huge.jxl");
-        assert!(check_dimensions(path, 16_000, 9_000).is_ok());
-        assert!(check_dimensions(path, 20_000, 20_000).is_err());
+        assert!(check_dimensions("test.png", 16_000, 9_000).is_ok());
+        assert!(check_dimensions("test.png", 20_000, 20_000).is_err());
     }
 }

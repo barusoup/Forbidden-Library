@@ -44,6 +44,86 @@ const MAX_KDF_PARALLELISM: u32 = 16;
 pub enum Purpose {
     Blob = 1,
     Manifest = 2,
+    /// A file of the whole library, sealed under the library key.
+    File = 3,
+}
+
+/// Seals whatever is written to it, as [`seal_stream`] would seal the same
+/// bytes. For a writer that produces its data in pieces, such as an import
+/// that hashes and seals in one pass. Call [`SealWriter::finish`] to write
+/// the final record; a writer dropped unfinished leaves a stream that will
+/// not open.
+pub struct SealWriter<W: Write> {
+    cipher: XChaCha20Poly1305,
+    header: Vec<u8>,
+    prefix: [u8; PREFIX_LEN],
+    output: W,
+    pending: Vec<u8>,
+    index: u64,
+}
+
+impl<W: Write> SealWriter<W> {
+    pub fn new(key: &Key, purpose: Purpose, context: &[u8], mut output: W) -> Result<Self> {
+        let mut prefix = [0u8; PREFIX_LEN];
+        random(&mut prefix)?;
+        let header = header(purpose, context, &prefix)?;
+        output.write_all(&header)?;
+        Ok(Self {
+            cipher: key.cipher(),
+            header,
+            prefix,
+            output,
+            pending: Vec::with_capacity(CHUNK + 1),
+            index: 0,
+        })
+    }
+
+    fn emit(&mut self, data: &[u8], last: bool) -> std::io::Result<()> {
+        let flag = [u8::from(last)];
+        let mut aad = self.header.clone();
+        aad.extend_from_slice(&flag);
+        let sealed = self
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce(&self.prefix, self.index)),
+                Payload {
+                    msg: data,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| std::io::Error::other("the data could not be sealed"))?;
+        self.output.write_all(&flag)?;
+        self.output
+            .write_all(&(sealed.len() as u32).to_le_bytes())?;
+        self.output.write_all(&sealed)?;
+        self.index += 1;
+        Ok(())
+    }
+
+    /// Write the final record and return the underlying writer.
+    pub fn finish(mut self) -> Result<W> {
+        let pending = std::mem::take(&mut self.pending);
+        self.emit(&pending, true)?;
+        self.output.flush()?;
+        Ok(self.output)
+    }
+}
+
+impl<W: Write> Write for SealWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(data);
+        // A record is emitted only once more data follows it, so the last
+        // record is always the one `finish` writes.
+        while self.pending.len() > CHUNK {
+            let record: Vec<u8> = self.pending.drain(..CHUNK).collect();
+            self.emit(&record, false)?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
 }
 
 /// Argon2id cost parameters. Stored with each lock, so new locks can use a
@@ -131,6 +211,18 @@ impl Key {
         let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
         random(bytes.as_mut_slice())?;
         Ok(Self(bytes))
+    }
+
+    /// The key as SQLCipher's raw-key literal, `x'…'`. Zeroed when dropped.
+    pub fn hex_key(&self) -> Zeroizing<String> {
+        let mut text = Zeroizing::new(String::with_capacity(3 + 2 * KEY_LEN));
+        text.push_str("x'");
+        for byte in self.0.iter() {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+        }
+        text.push('\'');
+        text
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {

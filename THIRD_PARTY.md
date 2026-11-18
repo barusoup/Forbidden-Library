@@ -77,6 +77,12 @@ original SVGs are in `assets/icons/lucide/`, and the page inlines their paths.
 ## Rust dependencies
 
 The complete dependency graph and versions are recorded in `Cargo.lock`.
-Notable licenses include MIT and Apache-2.0 for the Rust crates, SQLite
-(public domain) via `rusqlite`'s bundled build, and the image codec crates
-under their respective permissive licenses.
+Notable licenses include MIT and Apache-2.0 for the Rust crates, and the image
+codec crates under their respective permissive licenses.
+
+The catalogue database is SQLCipher (its community edition, under a BSD-style
+licence), a fork of SQLite (public domain), built through `rusqlite` with
+`bundled-sqlcipher-vendored-openssl`. The OpenSSL it links is OpenSSL 3,
+licensed under the Apache License 2.0, built from source by the `openssl-src`
+crate (`openssl-src` and `openssl-sys` are MIT and Apache-2.0). Building it needs
+Perl, see the README.

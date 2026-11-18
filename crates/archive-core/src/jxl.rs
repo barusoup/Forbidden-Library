@@ -51,18 +51,26 @@ pub fn has_signature(path: &Path) -> bool {
 pub fn decode(path: &Path) -> Result<DynamicImage> {
     let file = std::fs::File::open(path)
         .map_err(|error| Error::Msg(format!("open image {}: {error}", path.display())))?;
-    let mut decoder =
-        JxlDecoder::new(BufReader::new(file)).map_err(|error| decode_error(path, error))?;
-    let (width, height) = decoder.dimensions();
-    decode::check_dimensions(path, width, height)?;
-    decoder
-        .set_limits(decode::limits())
-        .map_err(|error| decode_error(path, error))?;
-    DynamicImage::from_decoder(decoder).map_err(|error| decode_error(path, error))
+    decode_reader(BufReader::new(file), &path.display().to_string())
 }
 
-fn decode_error(path: &Path, error: impl std::fmt::Display) -> Error {
-    Error::Msg(format!("decode image {}: {error}", path.display()))
+/// Decode a JPEG XL held in memory. See [`decode`].
+pub fn decode_bytes(bytes: &[u8], label: &str) -> Result<DynamicImage> {
+    decode_reader(std::io::Cursor::new(bytes), label)
+}
+
+fn decode_reader(reader: impl std::io::BufRead, label: &str) -> Result<DynamicImage> {
+    let mut decoder = JxlDecoder::new(reader).map_err(|error| decode_error(label, error))?;
+    let (width, height) = decoder.dimensions();
+    decode::check_dimensions(label, width, height)?;
+    decoder
+        .set_limits(decode::limits())
+        .map_err(|error| decode_error(label, error))?;
+    DynamicImage::from_decoder(decoder).map_err(|error| decode_error(label, error))
+}
+
+fn decode_error(label: &str, error: impl std::fmt::Display) -> Error {
+    Error::Msg(format!("decode image {label}: {error}"))
 }
 
 /// What a JPEG XL file holds, read from its header without decoding pixels.
@@ -78,19 +86,37 @@ pub fn header(path: &Path) -> Result<Header> {
     let image = JxlImage::builder()
         .open(path)
         .map_err(|error| Error::Msg(format!("read JPEG XL header {}: {error}", path.display())))?;
-    Ok(Header {
+    Ok(header_of(&image))
+}
+
+/// The header of a JPEG XL held in memory. See [`header`].
+pub fn header_bytes(bytes: &[u8]) -> Result<Header> {
+    let image = JxlImage::builder()
+        .read(std::io::Cursor::new(bytes))
+        .map_err(|error| Error::Msg(format!("read JPEG XL header: {error}")))?;
+    Ok(header_of(&image))
+}
+
+fn header_of(image: &JxlImage) -> Header {
+    Header {
         width: image.width(),
         height: image.height(),
         orientation: image.image_header().metadata.orientation,
-    })
+    }
 }
 
 /// Whether the decoder itself turns this file upright. libjxl writes the EXIF
 /// rotation of a transcoded JPEG into the codestream, and jxl-oxide applies
 /// it while rendering. An orientation taken from the original must then be
 /// left alone, or the picture is rotated twice.
+#[cfg(test)]
 pub fn oriented_by_decoder(path: &Path) -> bool {
     has_signature(path) && header(path).is_ok_and(|header| header.orientation != 1)
+}
+
+/// [`oriented_by_decoder`] for a file held in memory.
+pub fn oriented_by_decoder_bytes(bytes: &[u8]) -> bool {
+    is_jxl(bytes) && header_bytes(bytes).is_ok_and(|header| header.orientation != 1)
 }
 
 /// Losslessly transcode a JPEG. The JPEG's own bytes travel inside the

@@ -88,6 +88,10 @@ pub struct MediaView {
     pub frames_shown: u64,
     /// Synced lyrics of a song, in time order. Empty for anything else.
     pub lyrics: Vec<LyricLine>,
+    /// The plaintext copy the player streams from, kept while it plays. A
+    /// sealed library's original is only ever decrypted to this. It is the last
+    /// field, so it is dropped after the player that reads it.
+    pub source: Option<archive_core::PlainFile>,
 }
 
 impl MediaView {
@@ -102,6 +106,7 @@ impl MediaView {
             retired: Vec::new(),
             frames_shown: 0,
             lyrics: Vec::new(),
+            source: None,
         }
     }
 

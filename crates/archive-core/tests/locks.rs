@@ -70,8 +70,13 @@ fn locking_hides_items_and_unlocking_restores_them() {
     std::fs::create_dir_all(&sources).unwrap();
     let root = work.path().join("lib");
     let (library, ids) = library_with_photos(&root, &sources);
-    let original =
-        std::fs::read(library.source_path(&library.item(&ids[0]).unwrap().unwrap())).unwrap();
+    let original = std::fs::read(
+        library
+            .plain_source(&library.item(&ids[0]).unwrap().unwrap())
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
 
     let other = library.create_collection("Other").unwrap();
     let private = library.create_collection("Private").unwrap();
@@ -131,7 +136,7 @@ fn locking_hides_items_and_unlocking_restores_them() {
     assert_eq!(visible_count(&library), 1);
     let restored = library.item(&ids[0]).unwrap().unwrap();
     assert_eq!(
-        std::fs::read(library.source_path(&restored)).unwrap(),
+        std::fs::read(library.plain_source(&restored).unwrap().path()).unwrap(),
         original
     );
 
@@ -383,7 +388,11 @@ fn unlock_restores_ready_previews_without_decoding_originals() {
             }
             // A missing original makes this fail if either loader tries to
             // regenerate its cache. Both must work immediately after unlock.
-            let original = library.source_path(&restored);
+            let original = library
+                .plain_source(&restored)
+                .unwrap()
+                .path()
+                .to_path_buf();
             let bytes = std::fs::read(&original).unwrap();
             std::fs::remove_file(&original).unwrap();
             assert_eq!(library.load_thumb_rgba(&restored).unwrap(), thumb);

@@ -12,6 +12,8 @@ pub struct Paths {
     tmp: PathBuf,
     logs: PathBuf,
     vault: PathBuf,
+    /// The library key, when the library is sealed. Shared by every clone.
+    pub(crate) key: crate::sealed::KeySlot,
 }
 
 impl Paths {
@@ -24,6 +26,7 @@ impl Paths {
             tmp: root.join("tmp"),
             logs: root.join("logs"),
             vault: root.join("vault"),
+            key: Default::default(),
             root,
         };
         for dir in [
@@ -155,6 +158,21 @@ impl Paths {
         let id = safe_id(id);
         let (a, _) = split_hash(&id);
         self.thumbs.join(a).join(format!("{id}_2048.png"))
+    }
+
+    /// The catalogue-relative path of an item's grid thumbnail.
+    pub fn thumb_rel(id: &str) -> String {
+        Self::preview_rel_paths(id)[0].clone()
+    }
+
+    /// The catalogue-relative path of an item's viewer proxy, as a JPEG.
+    pub fn viewer_jpeg_rel(id: &str) -> String {
+        Self::preview_rel_paths(id)[1].clone()
+    }
+
+    /// The catalogue-relative path of an item's viewer proxy, as a PNG.
+    pub fn viewer_png_rel(id: &str) -> String {
+        Self::preview_rel_paths(id)[2].clone()
     }
 
     /// Every preview file an item can have, relative to the library root and

@@ -58,6 +58,10 @@ pub enum AppEvent {
     SemanticAdvanced,
     /// A lock, unlock or seal finished on its background thread.
     Vault(VaultDone),
+    /// A password job on the library finished on its background thread.
+    AppLock(AppLockDone),
+    /// A library conversion has got this far.
+    LibraryProgress(archive_core::Progress),
 }
 
 /// What a vault job was, so its result is read the way it was asked for.
@@ -74,6 +78,33 @@ pub struct VaultDone {
     pub collection: i64,
     pub kind: VaultKind,
     pub result: Result<(), archive_core::Error>,
+}
+
+/// What a password job on the library was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppLockKind {
+    /// Open a sealed library with its password.
+    Unlock,
+    /// Put a password on a plain library, sealing it.
+    Set,
+    /// Replace the password of a sealed library.
+    Change,
+    /// Take the password off, converting the library back to plain.
+    Remove,
+}
+
+/// How a password job ended, when it ended without an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppLockReply {
+    /// The job did what it was asked.
+    Done,
+    /// The password typed is not the library's.
+    Wrong,
+}
+
+pub struct AppLockDone {
+    pub kind: AppLockKind,
+    pub result: Result<AppLockReply, String>,
 }
 
 pub struct TextureJob {

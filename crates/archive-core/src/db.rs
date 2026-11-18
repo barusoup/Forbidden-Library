@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 pub const APPLICATION_ID: i64 = 0x4D59_4152;
 /// The schema this build writes. Older libraries migrate forward; newer ones
 /// are refused so an old app can never damage them.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The canonical column order every item read uses.
 const ITEM_COLUMNS: &str = "\
@@ -28,11 +28,30 @@ const ITEM_COLUMNS: &str = "\
     i.orientation, i.gps_lat, i.gps_lon, i.avg_color, i.checksum, i.content_hash, \
     i.thumb_recipe, i.thumb_error, i.opt_error";
 
-pub fn open(path: &Path) -> Result<Connection> {
+/// Whether the file at `path` is a plain SQLite database, as opposed to a
+/// sealed one or a file that is not there.
+pub fn is_plain_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    match std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut header)) {
+        Ok(()) => &header == b"SQLite format 3\0",
+        Err(_) => false,
+    }
+}
+
+/// Open the catalogue. A sealed library passes its key, which must be applied
+/// before anything else touches the file; a plain library passes `None`.
+pub fn open(path: &Path, key: Option<&crate::crypto::Key>) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    if let Some(key) = key {
+        conn.execute_batch(&format!("PRAGMA key = \"{}\";", key.hex_key().as_str()))?;
+        // A wrong key only shows at the first read of the file.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|_| crate::error::Error::msg("the library key does not open this library"))?;
+    }
     conn.busy_timeout(std::time::Duration::from_secs(10))?;
     // The catalogue is the app's own file, but it is also the one file a
     // disk error or an interrupted write can damage. Defensive mode refuses
@@ -336,6 +355,38 @@ fn migrate(conn: &Connection) -> Result<()> {
                 item_id TEXT NOT NULL
              );
              PRAGMA user_version = 10;
+             COMMIT;",
+        )?;
+    }
+    if version < 11 {
+        // User-defined tags on items. SQLite TEXT defaults to BINARY collation,
+        // keeping tags case-sensitive.
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS item_tags (
+                item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (item_id, tag)
+             );
+             CREATE INDEX IF NOT EXISTS item_tags_tag ON item_tags(tag);
+             PRAGMA user_version = 11;
+             COMMIT;",
+        )?;
+    }
+    if version < 12 {
+        // Collection-level tags, independent of the tags on any items inside
+        // the collection. SQLite TEXT uses BINARY collation (case-sensitive).
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS collection_tags (
+                collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                tag TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (collection_id, tag)
+             );
+             CREATE INDEX IF NOT EXISTS collection_tags_tag ON collection_tags(tag);
+             PRAGMA user_version = 12;
              COMMIT;",
         )?;
     }
@@ -1166,6 +1217,31 @@ pub fn delete_collection(conn: &Connection, id: i64) -> Result<()> {
     conn.execute("DELETE FROM collections WHERE id = ?1", params![id])?;
     Ok(())
 }
+
+/// Give a collection a new name. Names are unique without regard to case, so
+/// a name that another collection already has is refused.
+pub fn rename_collection(conn: &Connection, id: i64, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(crate::error::Error::Msg(
+            "collection name cannot be empty".into(),
+        ));
+    }
+    match conn.execute(
+        "UPDATE collections SET name = ?1 WHERE id = ?2",
+        params![name, id],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if error.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(crate::error::Error::Msg(
+                "a collection with that name already exists".into(),
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 /// Add items to an ordinary collection. An item inside a locked collection is
 /// skipped: it can only leave that collection by being released from it.
 pub fn add_to_collection(conn: &Connection, collection_id: i64, ids: &[String]) -> Result<usize> {
@@ -1335,6 +1411,196 @@ pub fn collections_containing_all(conn: &Connection, ids: &[String]) -> Result<V
     Ok(collections)
 }
 
+/// Tags attached to `item_id`, in the order they were added.
+pub fn item_tags(conn: &Connection, item_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT tag FROM item_tags WHERE item_id = ?1 ORDER BY created_at ASC, tag ASC",
+    )?;
+    let rows = stmt.query_map(params![item_id], |row| row.get::<_, String>(0))?;
+    let mut tags = Vec::new();
+    for row in rows {
+        tags.push(row?);
+    }
+    Ok(tags)
+}
+
+/// Attach a case-sensitive tag to one item. Returns true if it was newly added.
+pub fn add_item_tag(conn: &Connection, item_id: &str, tag: &str) -> Result<bool> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO item_tags (item_id, tag, created_at) VALUES (?1, ?2, ?3)",
+        params![item_id, tag, time::now_ms()],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Remove a case-sensitive tag from one item. Returns true if a row was removed.
+pub fn remove_item_tag(conn: &Connection, item_id: &str, tag: &str) -> Result<bool> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "DELETE FROM item_tags WHERE item_id = ?1 AND tag = ?2",
+        params![item_id, tag],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Tags attached to `collection_id` itself (independent of its items' tags).
+pub fn collection_tags(conn: &Connection, collection_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT tag FROM collection_tags WHERE collection_id = ?1 ORDER BY created_at ASC, tag ASC",
+    )?;
+    let rows = stmt.query_map(params![collection_id], |row| row.get::<_, String>(0))?;
+    let mut tags = Vec::new();
+    for row in rows {
+        tags.push(row?);
+    }
+    Ok(tags)
+}
+
+/// Attach a case-sensitive tag to `collection_id` itself (does not affect its items).
+pub fn add_collection_tag(conn: &Connection, collection_id: i64, tag: &str) -> Result<bool> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO collection_tags (collection_id, tag, created_at) VALUES (?1, ?2, ?3)",
+        params![collection_id, tag, time::now_ms()],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Remove a case-sensitive tag from `collection_id` itself (does not affect its items).
+pub fn remove_collection_tag(conn: &Connection, collection_id: i64, tag: &str) -> Result<bool> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "DELETE FROM collection_tags WHERE collection_id = ?1 AND tag = ?2",
+        params![collection_id, tag],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Collection ids whose own tags match `query` (case-sensitive),
+/// ordered with exact tag matches first, then substring matches.
+pub fn search_collections_by_tag(conn: &Connection, query: &str) -> Result<Vec<i64>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT collection_id
+         FROM collection_tags
+         WHERE instr(tag, ?1) > 0
+         GROUP BY collection_id
+         ORDER BY MAX(CASE WHEN tag = ?1 THEN 1 ELSE 0 END) DESC, collection_id ASC",
+    )?;
+    let rows = stmt.query_map(params![query], |row| row.get::<_, i64>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
+/// Most likely existing tag matching `prefix` (case-sensitive), ranked by usage count
+/// across item and collection tags, optionally excluding tags already attached to
+/// `exclude_item_id` or `exclude_collection_id`.
+pub fn suggest_tag(
+    conn: &Connection,
+    prefix: &str,
+    exclude_item_id: Option<&str>,
+    exclude_collection_id: Option<i64>,
+) -> Result<Option<String>> {
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    let char_len = prefix.chars().count() as i64;
+    if let Some(item_id) = exclude_item_id {
+        let mut stmt = conn.prepare_cached(
+            "SELECT tag FROM (
+                 SELECT tag FROM item_tags WHERE substr(tag, 1, ?2) = ?1
+                 UNION ALL
+                 SELECT tag FROM collection_tags WHERE substr(tag, 1, ?2) = ?1
+             )
+             WHERE tag NOT IN (SELECT tag FROM item_tags WHERE item_id = ?3)
+             GROUP BY tag
+             ORDER BY COUNT(*) DESC, tag ASC
+             LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![prefix, char_len, item_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?)
+    } else if let Some(collection_id) = exclude_collection_id {
+        let mut stmt = conn.prepare_cached(
+            "SELECT tag FROM (
+                 SELECT tag FROM item_tags WHERE substr(tag, 1, ?2) = ?1
+                 UNION ALL
+                 SELECT tag FROM collection_tags WHERE substr(tag, 1, ?2) = ?1
+             )
+             WHERE tag NOT IN (SELECT tag FROM collection_tags WHERE collection_id = ?3)
+             GROUP BY tag
+             ORDER BY COUNT(*) DESC, tag ASC
+             LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![prefix, char_len, collection_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?)
+    } else {
+        let mut stmt = conn.prepare_cached(
+            "SELECT tag FROM (
+                 SELECT tag FROM item_tags WHERE substr(tag, 1, ?2) = ?1
+                 UNION ALL
+                 SELECT tag FROM collection_tags WHERE substr(tag, 1, ?2) = ?1
+             )
+             GROUP BY tag
+             ORDER BY COUNT(*) DESC, tag ASC
+             LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![prefix, char_len], |row| row.get::<_, String>(0))
+            .optional()?)
+    }
+}
+
+/// Visible active item ids whose tags match `query` (case-sensitive),
+/// ordered with exact tag matches first, then substring matches.
+pub fn search_items_by_tag(conn: &Connection, query: &str) -> Result<Vec<String>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id
+         FROM items i
+         JOIN item_tags t ON t.item_id = i.id
+         WHERE i.deleted_at IS NULL
+           AND i.vault_id IS NULL
+           AND instr(t.tag, ?1) > 0
+         GROUP BY i.id
+         ORDER BY MAX(CASE WHEN t.tag = ?1 THEN 1 ELSE 0 END) DESC,
+                  i.captured_at DESC, i.added_at DESC, i.id DESC",
+    )?;
+    let rows = stmt.query_map(params![query], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
 pub fn record_failure(conn: &Connection, path: &Path, error: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO failures (path, error, at) VALUES (?1, ?2, ?3)
@@ -1486,7 +1752,7 @@ mod tests {
             crate::time::stamp()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let conn = open(&dir.join("library.db")).unwrap();
+        let conn = open(&dir.join("library.db"), None).unwrap();
         let plan: Vec<String> = conn
             .prepare(
                 "EXPLAIN QUERY PLAN SELECT id FROM items i
@@ -1520,7 +1786,7 @@ mod tests {
             crate::time::stamp()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let conn = open(&dir.join("library.db")).unwrap();
+        let conn = open(&dir.join("library.db"), None).unwrap();
         let app_id: i64 = conn
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
@@ -1546,7 +1812,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE notes (body TEXT); INSERT INTO notes VALUES ('hello');")
             .unwrap();
         drop(conn);
-        let error = open(&path).expect_err("a foreign file must be refused");
+        let error = open(&path, None).expect_err("a foreign file must be refused");
         assert!(
             error
                 .to_string()
@@ -1575,13 +1841,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("library.db");
-        drop(open(&path).unwrap());
+        drop(open(&path, None).unwrap());
         {
             // Recreate the shape schema 3 had: no recipe or error columns and
             // none of schema 4's indexes.
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 "DROP INDEX IF EXISTS items_vault;
+                 DROP TABLE IF EXISTS collection_tags;
+                 DROP TABLE IF EXISTS item_tags;
                  ALTER TABLE items DROP COLUMN vault_id;
                  ALTER TABLE collections DROP COLUMN vault_seal;
                  ALTER TABLE collections DROP COLUMN vault_open;
@@ -1603,7 +1871,7 @@ mod tests {
             )
             .unwrap();
         }
-        let conn = open(&path).unwrap();
+        let conn = open(&path, None).unwrap();
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -1621,6 +1889,113 @@ mod tests {
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
         assert_eq!(app_id, APPLICATION_ID);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tags_are_case_sensitive_suggest_by_frequency_and_search_exact_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "forbiddenlibrary-tags-{}-{}",
+            std::process::id(),
+            crate::time::stamp()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open(&dir.join("library.db"), None).unwrap();
+
+        let mk_item = |id: &str, captured_at: i64| Item {
+            id: id.into(),
+            kind: Kind::Image,
+            mime: "image/png".into(),
+            ext: "png".into(),
+            original_ext: "png".into(),
+            bytes: 100,
+            original_bytes: 100,
+            width: Some(10),
+            height: Some(10),
+            duration_ms: None,
+            captured_at,
+            captured_source: "file-time".into(),
+            added_at: captured_at,
+            modified_at: captured_at,
+            original_name: format!("{id}.png"),
+            rel_path: format!("media/{id}.png"),
+            thumb_state: ThumbState::Ready,
+            opt_state: OptState::None,
+            opt_kind: None,
+            deleted_at: None,
+            camera_make: None,
+            camera_model: None,
+            lens: None,
+            iso: None,
+            f_number: None,
+            exposure: None,
+            focal_mm: None,
+            orientation: 1,
+            gps: None,
+            avg_color: 0,
+            checksum: id.into(),
+            content_hash: id.into(),
+            thumb_recipe: 1,
+            thumb_error: None,
+            opt_error: None,
+        };
+
+        insert_item(&conn, &mk_item("a", 1000), Path::new("a.png"), None).unwrap();
+        insert_item(&conn, &mk_item("b", 2000), Path::new("b.png"), None).unwrap();
+        insert_item(&conn, &mk_item("c", 3000), Path::new("c.png"), None).unwrap();
+
+        // Any amount of tags per item; case-sensitive.
+        assert!(add_item_tag(&conn, "a", "Food").unwrap());
+        assert!(!add_item_tag(&conn, "a", "Food").unwrap());
+        assert!(add_item_tag(&conn, "a", "food").unwrap());
+        assert!(add_item_tag(&conn, "a", "Fast Food").unwrap());
+        assert!(add_item_tag(&conn, "b", "Food").unwrap());
+        assert!(add_item_tag(&conn, "c", "Fast Food").unwrap());
+
+        let a_tags = item_tags(&conn, "a").unwrap();
+        assert_eq!(a_tags.len(), 3);
+        assert!(a_tags.contains(&"Food".to_string()));
+        assert!(a_tags.contains(&"food".to_string()));
+        assert!(a_tags.contains(&"Fast Food".to_string()));
+
+        // Suggests most frequent case-sensitive prefix match, excluding tags the item already has.
+        assert_eq!(suggest_tag(&conn, "Fo", None, None).unwrap(), Some("Food".into()));
+        assert_eq!(suggest_tag(&conn, "Fo", Some("a"), None).unwrap(), None);
+        assert_eq!(suggest_tag(&conn, "Fo", Some("c"), None).unwrap(), Some("Food".into()));
+        assert_eq!(suggest_tag(&conn, "fo", None, None).unwrap(), Some("food".into()));
+        assert_eq!(suggest_tag(&conn, "Fa", None, None).unwrap(), Some("Fast Food".into()));
+        assert_eq!(suggest_tag(&conn, "X", None, None).unwrap(), None);
+
+        // Search prioritizes exact tag match ("b", "a") over substring ("c").
+        assert_eq!(search_items_by_tag(&conn, "Food").unwrap(), vec!["b", "a", "c"]);
+        assert_eq!(search_items_by_tag(&conn, "food").unwrap(), vec!["a"]);
+
+        // Collection tags are completely independent from their children's tags and vice versa.
+        let cid = create_collection(&conn, "Meals").unwrap();
+        add_to_collection(&conn, cid, &["a".into(), "c".into()]).unwrap();
+        assert!(collection_tags(&conn, cid).unwrap().is_empty());
+
+        assert!(add_collection_tag(&conn, cid, "Dinner").unwrap());
+        assert!(!add_collection_tag(&conn, cid, "Dinner").unwrap());
+        assert_eq!(collection_tags(&conn, cid).unwrap(), vec!["Dinner"]);
+        assert!(!item_tags(&conn, "a").unwrap().contains(&"Dinner".to_string()));
+        assert!(!item_tags(&conn, "c").unwrap().contains(&"Dinner".to_string()));
+
+        assert_eq!(suggest_tag(&conn, "Di", None, Some(cid)).unwrap(), None);
+        assert_eq!(suggest_tag(&conn, "Di", Some("a"), None).unwrap(), Some("Dinner".into()));
+        assert_eq!(search_collections_by_tag(&conn, "Dinner").unwrap(), vec![cid]);
+        assert_eq!(search_collections_by_tag(&conn, "dinner").unwrap(), Vec::<i64>::new());
+        assert_eq!(search_collections_by_tag(&conn, "Food").unwrap(), Vec::<i64>::new());
+
+        assert!(remove_collection_tag(&conn, cid, "Dinner").unwrap());
+        assert!(collection_tags(&conn, cid).unwrap().is_empty());
+
+        // Removing a tag from an item works case-sensitively and never touches collections.
+        assert!(remove_item_tag(&conn, "a", "food").unwrap());
+        assert!(!item_tags(&conn, "a").unwrap().contains(&"food".to_string()));
+        assert!(item_tags(&conn, "a").unwrap().contains(&"Food".to_string()));
+
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

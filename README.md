@@ -18,6 +18,10 @@ your own machine.
   upload straight into the library over temporary HTTPS.
 - **Password-locked collections.** Contents are encrypted with
   XChaCha20-Poly1305 under a key wrapped with Argon2id.
+- **Library password.** Optionally, the whole library is encrypted on disk
+  under one password: the catalogue with SQLCipher, and every photo, video and
+  preview with XChaCha20-Poly1305. The app stays shut until the password is
+  typed, and it is set in Settings. A forgotten password cannot be recovered.
 - **Verification and backups.** The library can check every stored file against
   its checksum and write a consistent backup while the app is running.
 - **Hardened media decoding.** FFmpeg runs with time, memory and format limits;
@@ -50,7 +54,11 @@ folder.
 
 ## Building
 
-Requires a recent stable Rust toolchain on Windows and [Inno Setup 6](https://jrsoftware.org/isinfo.php).
+Requires a recent stable Rust toolchain on Windows, [Inno Setup 6](https://jrsoftware.org/isinfo.php),
+and a Perl on the `PATH` that builds Windows OpenSSL: the catalogue is SQLCipher,
+and its OpenSSL is compiled from source on the first build. [Strawberry
+Perl](https://strawberryperl.com) works; the Perl that ships with Git for Windows
+or Cygwin does not.
 
 ```powershell
 cargo test --workspace

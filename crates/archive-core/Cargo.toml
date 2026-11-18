@@ -24,7 +24,7 @@ image = { version = "0.25", default-features = false, features = [
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 kamadak-exif = "0.6"
 oxipng = { version = "9", default-features = false }
-rusqlite = { version = "0.32", features = ["bundled", "limits", "backup"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "limits", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

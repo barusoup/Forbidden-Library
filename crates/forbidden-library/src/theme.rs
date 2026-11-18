@@ -36,13 +36,13 @@ pub fn archive_theme(dark: bool) -> Theme {
         theme.ok = Color::rgb(0x9d, 0xc4, 0x9d);
         theme.info = theme.muted;
     } else {
-        theme.bg = Color::rgb(0xff, 0xff, 0xff);
-        theme.g1 = Color::rgb(0xf7, 0xf8, 0xf9);
-        theme.g2 = Color::rgb(0xee, 0xf0, 0xf2);
-        theme.g3 = Color::rgb(0xe3, 0xe6, 0xe9);
+        theme.bg = Color::rgb(0xe3, 0xe6, 0xe9);
+        theme.g1 = Color::rgb(0xee, 0xf0, 0xf2);
+        theme.g2 = Color::rgb(0xf7, 0xf8, 0xf9);
+        theme.g3 = Color::rgb(0xff, 0xff, 0xff);
         theme.pressed = Color::rgb(0xda, 0xdc, 0xe0);
-        theme.pane = theme.bg;
-        theme.pane_alpha_bg = theme.bg;
+        theme.pane = theme.g1;
+        theme.pane_alpha_bg = theme.g1;
         theme.pane_alpha_g2 = theme.g2;
         theme.fg = Color::rgb(0x20, 0x21, 0x24);
         theme.muted = Color::rgb(0x5f, 0x63, 0x68);

@@ -2,7 +2,6 @@ use crate::Library;
 use crate::db;
 use crate::error::Result;
 use crate::model::VerifyReport;
-use crate::store;
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug)]
@@ -166,7 +165,7 @@ fn check_row(library: &Library, row: &db::VerifyRow, options: VerifyOptions) -> 
         return check;
     }
     if options.hashes {
-        match store::hash_file(&path) {
+        match crate::sealed::hash_stored(library.paths(), &row.rel_path) {
             Ok(hash) if hash == row.checksum => {}
             _ => check.corrupt = true,
         }

@@ -18,6 +18,7 @@
 //! `verify`), but never a half-written archive file.
 
 mod anim;
+pub mod applock;
 mod audio;
 mod crypto;
 mod db;
@@ -28,11 +29,13 @@ mod import;
 mod jxl;
 mod locked;
 mod lyrics;
+mod migrate;
 mod model;
 mod optimize;
 mod paths;
 mod playback;
 mod probe;
+mod sealed;
 mod semantic;
 mod store;
 mod thumb;
@@ -47,6 +50,7 @@ pub use error::{Error, Result};
 pub use ffmpeg::{Stream, Tools, VideoOut, spawn_audio, spawn_video};
 pub use import::{ImportEvent, ImportOptions, import_paths};
 pub use lyrics::{Line as LyricLine, current as current_lyric, parse as parse_lyrics};
+pub use migrate::{Encryption, Progress};
 pub use model::BackupReport;
 pub use model::{
     Album, COVER_LAYERS, Collection, ImportReport, Item, Kind, LockState, OptState, Stats,
@@ -56,14 +60,17 @@ pub use optimize::OptimizeConfig;
 pub use paths::Paths;
 pub use playback::{PlaybackInfo, fit_even, playback_info, playback_info_from_json};
 pub use probe::{MediaInfo, inspect};
+pub use sealed::Plain as PlainFile;
 pub use semantic::{EMBED_DIMS, EMBED_MODEL, VectorIndex, prepare};
 pub use thumb::{FULL_SIDE, RECIPE as THUMB_RECIPE, THUMB_SIDE, VIEWER_SIDE};
 pub use verify::VerifyOptions;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
+
+use rusqlite::Connection;
 
 /// Takes the file gate for writing. A poisoned gate is still usable: it only
 /// orders file work, and no data hangs off it.
@@ -140,7 +147,15 @@ impl Library {
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
-        let conn = db::open(paths.db())?;
+        // A sealed library cannot be read until its password is given, so it
+        // opens locked: the catalogue stays closed behind an empty stand-in
+        // until `unlock` loads the key. See [`Library::encryption`].
+        let sealed = applock::read(paths.root())?.is_some();
+        let conn = if sealed {
+            Connection::open_in_memory()?
+        } else {
+            db::open(paths.db(), None)?
+        };
         let library = Self {
             paths,
             db: Mutex::new(conn),
@@ -149,15 +164,22 @@ impl Library {
             in_flight: import::InFlight::default(),
             _lock: lock,
         };
-        library.clean_tmp()?;
-        // Plaintext left behind by an interrupted lock or unlock goes now, and
-        // sealed folders no lock refers to are removed. Neither blocks opening.
-        let _ = library.reconcile_vault();
-        // Items left in the trash past the retention window go for good. A
-        // failed sweep must never keep the library from opening; the next
-        // open (or the next visit to Trash) tries again.
-        let _ = library.purge_expired_trash();
+        if !sealed {
+            library.finish_open();
+        }
         Ok(library)
+    }
+
+    /// The housekeeping that follows a catalogue being opened: staging leftovers,
+    /// plaintext left by an interrupted lock, and expired trash. None of it may
+    /// keep the library from opening, so failures are ignored and retried next time.
+    pub(crate) fn finish_open(&self) {
+        let _ = self.clean_tmp();
+        // Plaintext left behind by an interrupted lock or unlock goes now, and
+        // sealed folders no lock refers to are removed.
+        let _ = self.reconcile_vault();
+        // Items left in the trash past the retention window go for good.
+        let _ = self.purge_expired_trash();
     }
 
     pub fn paths(&self) -> &Paths {
@@ -314,6 +336,15 @@ impl Library {
         db::delete_collection(&self.conn(), id)
     }
 
+    /// Rename a collection. A locked collection cannot be renamed: its name
+    /// is only changed while this session holds its key.
+    pub fn rename_collection(&self, id: i64, name: &str) -> Result<()> {
+        if self.lock_state(id)? == LockState::Locked {
+            return Err(Error::msg("unlock this collection before renaming it"));
+        }
+        db::rename_collection(&self.conn(), id, name)
+    }
+
     pub fn remove_from_collection(&self, collection_id: i64, ids: &[String]) -> Result<usize> {
         let _files = self.files.read().unwrap_or_else(|e| e.into_inner());
         if self.lock_state(collection_id)? == LockState::Locked {
@@ -344,6 +375,74 @@ impl Library {
         }
     }
 
+    /// Tags attached to `item_id`, in the order they were added.
+    pub fn item_tags(&self, item_id: &str) -> Result<Vec<String>> {
+        db::item_tags(&self.conn(), item_id)
+    }
+
+    /// Attach a case-sensitive tag to one item. Returns true if it was newly added.
+    pub fn add_item_tag(&self, item_id: &str, tag: &str) -> Result<bool> {
+        db::add_item_tag(&self.conn(), item_id, tag)
+    }
+
+    /// Remove a case-sensitive tag from one item. Returns true if a row was removed.
+    pub fn remove_item_tag(&self, item_id: &str, tag: &str) -> Result<bool> {
+        db::remove_item_tag(&self.conn(), item_id, tag)
+    }
+
+    /// Tags attached to `collection_id` itself (independent of its items' tags).
+    pub fn collection_tags(&self, collection_id: i64) -> Result<Vec<String>> {
+        match self.lock_state(collection_id)? {
+            LockState::Locked => Ok(Vec::new()),
+            LockState::Unlocked | LockState::None => {
+                db::collection_tags(&self.conn(), collection_id)
+            }
+        }
+    }
+
+    /// Attach a case-sensitive tag to `collection_id` itself (does not affect its items).
+    pub fn add_collection_tag(&self, collection_id: i64, tag: &str) -> Result<bool> {
+        match self.lock_state(collection_id)? {
+            LockState::Locked => Err(Error::msg("unlock this collection to tag it")),
+            LockState::Unlocked | LockState::None => {
+                db::add_collection_tag(&self.conn(), collection_id, tag)
+            }
+        }
+    }
+
+    /// Remove a case-sensitive tag from `collection_id` itself (does not affect its items).
+    pub fn remove_collection_tag(&self, collection_id: i64, tag: &str) -> Result<bool> {
+        match self.lock_state(collection_id)? {
+            LockState::Locked => Err(Error::msg("unlock this collection to edit its tags")),
+            LockState::Unlocked | LockState::None => {
+                db::remove_collection_tag(&self.conn(), collection_id, tag)
+            }
+        }
+    }
+
+    /// Collection ids whose own tags match `query` (case-sensitive),
+    /// ordered with exact tag matches first, then substring matches.
+    pub fn search_collections_by_tag(&self, query: &str) -> Result<Vec<i64>> {
+        db::search_collections_by_tag(&self.conn(), query)
+    }
+
+    /// Most likely existing tag matching `prefix` (case-sensitive), ranked by usage,
+    /// optionally excluding tags already attached to `exclude_item_id` or `exclude_collection_id`.
+    pub fn suggest_tag(
+        &self,
+        prefix: &str,
+        exclude_item_id: Option<&str>,
+        exclude_collection_id: Option<i64>,
+    ) -> Result<Option<String>> {
+        db::suggest_tag(&self.conn(), prefix, exclude_item_id, exclude_collection_id)
+    }
+
+    /// Visible active item ids whose tags match `query` (case-sensitive),
+    /// ordered with exact tag matches first, then substring matches.
+    pub fn search_items_by_tag(&self, query: &str) -> Result<Vec<String>> {
+        db::search_items_by_tag(&self.conn(), query)
+    }
+
     pub fn set_thumb_state(
         &self,
         id: &str,
@@ -367,11 +466,10 @@ impl Library {
             return Ok(());
         }
         let tools = ffmpeg::Tools::discover();
-        let source = self.paths.abs(&item.rel_path);
         let outcome = thumb::generate(
             &self.paths,
             &item.id,
-            &source,
+            &item.rel_path,
             item.kind,
             item.orientation,
             item.duration_ms,
@@ -469,8 +567,7 @@ impl Library {
         if item.thumb_recipe != thumb::RECIPE || !path.is_file() {
             self.make_thumbnail_unlocked(&item)?;
         }
-        std::fs::read(&path)
-            .map_err(|error| Error::Msg(format!("read {}: {error}", path.display())))
+        sealed::read_bytes(&self.paths, &Paths::thumb_rel(&item.id))
     }
 
     /// Decoded viewer preview (long edge capped), ready for the GPU.
@@ -492,7 +589,7 @@ impl Library {
         thumb::preview_rgba(
             &self.paths,
             &item.id,
-            &self.paths.abs(&item.rel_path),
+            &item.rel_path,
             item.kind,
             item.orientation,
             item.duration_ms,
@@ -510,7 +607,7 @@ impl Library {
         let tools = ffmpeg::Tools::discover();
         thumb::full_rgba(
             &self.paths,
-            &self.paths.abs(&item.rel_path),
+            &item.rel_path,
             item.kind,
             item.orientation,
             item.duration_ms,
@@ -521,8 +618,9 @@ impl Library {
 
     /// Absolute path of an item's stored original, for code that opens the
     /// file itself (video and animation players stream from it).
-    pub fn source_path(&self, item: &Item) -> PathBuf {
-        self.paths.abs(&item.rel_path)
+    pub fn plain_source(&self, item: &Item) -> Result<PlainFile> {
+        let _files = self.files.read().unwrap_or_else(|e| e.into_inner());
+        sealed::plain_path(&self.paths, &item.rel_path)
     }
 
     /// Decoded 384px preview, ready to upload to the GPU. A preview built by
@@ -535,7 +633,8 @@ impl Library {
         if item.thumb_recipe != thumb::RECIPE || !path.is_file() {
             self.make_thumbnail_unlocked(&item)?;
         }
-        let image = crate::decode::open(&path)?.to_rgba8();
+        let bytes = sealed::read_bytes(&self.paths, &Paths::thumb_rel(&item.id))?;
+        let image = crate::decode::open_bytes(&bytes, &item.id)?.to_rgba8();
         let (w, h) = image.dimensions();
         Ok((w, h, image.into_raw()))
     }
@@ -630,6 +729,11 @@ impl Library {
     /// The result is published only after every file and the manifest succeeds.
     /// Do not call this from an import or optimization progress callback.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<BackupReport> {
+        if self.encryption() == Encryption::Locked {
+            return Err(Error::Msg(
+                "unlock the library with its password before backing it up".into(),
+            ));
+        }
         let _files = self.files.write().unwrap_or_else(|e| e.into_inner());
         let dest = dest.as_ref();
         let root = self
@@ -673,7 +777,13 @@ impl Library {
                 // WAL is live, without copying uncheckpointed frames verbatim
                 // and without blocking readers.
                 let conn = self.conn();
+                // A sealed library's snapshot is sealed under the same key, so the
+                // backup opens with the same password as the original.
+                let key_literal = self.paths.key.with(|key| key.map(|key| key.hex_key()));
                 let mut copy = rusqlite::Connection::open(&snapshot)?;
+                if let Some(literal) = &key_literal {
+                    copy.execute_batch(&format!("PRAGMA key = \"{}\";", literal.as_str()))?;
+                }
                 {
                     let backup = rusqlite::backup::Backup::new(&conn, &mut copy)?;
                     backup.run_to_completion(256, std::time::Duration::from_millis(0), None)?;
@@ -684,6 +794,11 @@ impl Library {
                     [],
                     |row| row.get::<_, i64>(0),
                 )? as usize;
+            }
+            // The key file lets the backup be opened with the same password.
+            let key_file = self.paths.root().join(applock::KEY_FILE);
+            if key_file.is_file() {
+                std::fs::copy(&key_file, staging.join(applock::KEY_FILE))?;
             }
             let manifest = serde_json::json!({
                 "app": "Forbidden Library",

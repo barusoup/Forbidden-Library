@@ -22,7 +22,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::Dark,
+            theme: ThemeChoice::System,
             optimize_on_import: true,
             library_root: None,
         }
@@ -50,6 +50,19 @@ impl Settings {
         let path = Self::file();
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    /// Write the settings file. The new text goes to a temporary file first,
+    /// so a crash cannot leave a half-written file behind.
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::file();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let temp = path.with_extension("json.tmp");
+        std::fs::write(&temp, text)?;
+        std::fs::rename(&temp, &path)
     }
 
     pub fn library_root(&self) -> PathBuf {

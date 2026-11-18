@@ -37,11 +37,12 @@ use std::path::Path;
 const MANIFEST_FILE: &str = "manifest.sealed";
 /// The tables a locked item's rows come from, in the order they are restored.
 /// A manifest naming any other table is refused, whatever its authentication.
-const ITEM_TABLES: [&str; 5] = [
+const ITEM_TABLES: [&str; 6] = [
     "items",
     "sources",
     "audio_tags",
     "lyrics",
+    "item_tags",
     "collection_items",
 ];
 
@@ -576,6 +577,7 @@ impl Library {
                 rows.extend(export(&conn, "sources", "item_id = ?1", &[&item_id])?);
                 rows.extend(export(&conn, "audio_tags", "item_id = ?1", &[&item_id])?);
                 rows.extend(export(&conn, "lyrics", "item_id = ?1", &[&item_id])?);
+                rows.extend(export(&conn, "item_tags", "item_id = ?1", &[&item_id])?);
                 rows.extend(export(
                     &conn,
                     "collection_items",
@@ -592,7 +594,8 @@ impl Library {
             let original = self.paths.checked_owned_path(&rel_path)?;
             let blob = if original.is_file() {
                 let name = random_name()?;
-                let source = File::open(&original)?;
+                let plain = crate::sealed::plain_path(&self.paths, &rel_path)?;
+                let source = File::open(plain.path())?;
                 let target = dir.join(format!("{name}.blob"));
                 let staged = dir.join(format!("{name}.partial"));
                 let mut out = BufWriter::new(File::create(&staged)?);
@@ -617,12 +620,13 @@ impl Library {
                 if !path.is_file() {
                     continue;
                 }
+                let plain = crate::sealed::plain_path(&self.paths, relative)?;
                 let blob = format!("{}.preview", random_name()?);
                 write_sealed_file(
                     key,
                     Purpose::Blob,
                     &preview_context(id, seal, &item_id, slot, &blob),
-                    File::open(path)?,
+                    File::open(plain.path())?,
                     &dir.join(&blob),
                 )?;
                 previews.push(SealedPreview { slot, blob });
@@ -902,11 +906,9 @@ impl Library {
                     "a sealed file in this collection does not match its record ({relative})"
                 )));
             }
-            let target = self.paths.checked_owned_path(relative)?;
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::rename(&staged, &target)?;
+            // Refuse a path outside the library before anything is written there.
+            self.paths.checked_owned_path(relative)?;
+            crate::sealed::seal_into(&self.paths, &staged, relative)?;
             Ok(())
         })();
         if outcome.is_err() {
@@ -1076,7 +1078,7 @@ mod audit_tests {
         });
         assert!(library.is_unlocked(collection));
         assert_eq!(
-            crate::store::hash_file(&library.source_path(&item)).unwrap(),
+            crate::store::hash_file(library.plain_source(&item).unwrap().path()).unwrap(),
             item.checksum
         );
     }
@@ -1103,7 +1105,7 @@ mod audit_tests {
             .unwrap();
         library.unlock(collection, "test password").unwrap();
         assert_eq!(
-            crate::store::hash_file(&library.source_path(&item)).unwrap(),
+            crate::store::hash_file(library.plain_source(&item).unwrap().path()).unwrap(),
             item.checksum
         );
     }

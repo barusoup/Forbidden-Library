@@ -24,7 +24,10 @@ use crate::viewer::{
     controls_wanted, ease_view, fraction_along, image_rect, is_double_click, max_zoom, pan,
     zoom_at,
 };
-use crate::worker::{self, AppEvent, TexKind, TextureJob, TexturePool, VaultDone, VaultKind};
+use crate::worker::{
+    self, AppEvent, AppLockDone, AppLockKind, AppLockReply, TexKind, TextureJob, TexturePool,
+    VaultDone, VaultKind,
+};
 use archive_core::{
     Album, AudioMeta, COVER_LAYERS, Collection, ImportEvent, ImportReport, Item, Kind, Library,
     LockState, LyricLine, MIN_PASSWORD_CHARS, OptimizeConfig, PageCursor, Stats, ThumbState,
@@ -83,6 +86,8 @@ pub enum Page {
     Collections,
     Collection(i64),
     Trash,
+    /// The app's own settings. Not a library page, so it has no nav slot.
+    Settings,
 }
 
 impl Page {
@@ -167,11 +172,20 @@ const SEARCH_OMEGA: f32 = 26.0;
 /// The new-collection field shuts on a stiffer spring. Opening from rest is
 /// gentle, but a close that eases in from rest drags, so it leaves brisker.
 const NAME_SHUT_OMEGA: f32 = 44.0;
-/// Header names for the three island rows, top to bottom.
-const NAV_TITLES: [&str; 4] = ["Media", "Albums", "Collections", "Trash"];
+/// Header names for the page stops on the revolver, top to bottom.
+const NAV_TITLES: [&str; 5] = ["Media", "Albums", "Collections", "Trash", "Settings"];
 const TITLE_SIZE: f32 = 24.0;
 /// Vertical distance between neighbouring names on the header drum.
 const TITLE_STEP: f32 = 36.0;
+
+fn nav_title_alpha(distance: f32, is_open_row: bool, open_t: f32) -> f32 {
+    let nav = (1.0 - distance.abs()).clamp(0.0, 1.0);
+    if is_open_row {
+        nav * (1.0 - open_t.clamp(0.0, 1.0))
+    } else {
+        nav
+    }
+}
 /// How many rows the island may travel off an open page before the name's own
 /// roll stops, so it fades out in step with the drum rather than popping.
 const NAME_ROLL_REACH: f32 = 0.25;
@@ -209,6 +223,9 @@ fn nav_row(page: &Page) -> f32 {
         Page::Albums | Page::Album(_) => 1.0,
         Page::Collections | Page::Collection(_) => 2.0,
         Page::Trash => 3.0,
+        // The gear is outside the page list, but Settings still occupies the
+        // next stop on the header drum so every title transition shares it.
+        Page::Settings => 4.0,
     }
 }
 
@@ -325,6 +342,23 @@ enum Modal {
     Import(ImportSession),
     /// Setting, entering or removing a collection's password.
     Password(PasswordSession),
+    /// Renaming a collection. Offered only while it is not locked.
+    Rename {
+        collection: i64,
+        name: String,
+        error: Option<String>,
+    },
+    /// Adding/viewing/removing tags on a collection.
+    TagCollection {
+        collection: i64,
+        name: String,
+        input: String,
+        suggestion: Option<String>,
+        tags: Vec<String>,
+        error: Option<String>,
+    },
+    /// Setting, changing or removing the app password.
+    AppPassword(AppPasswordSession),
 }
 
 /// What a password dialog is for.
@@ -386,6 +420,125 @@ impl PasswordSession {
             PasswordField::Password => &mut self.password,
             PasswordField::Confirm => &mut self.confirm,
         }
+    }
+}
+
+/// The app password screen. While it is up the window shows nothing else, and
+/// nothing comes in: the library is not drawn, and imports are refused.
+struct AppGate {
+    /// The password typed so far. Wiped when the screen goes.
+    typed: String,
+    /// Why the last attempt failed, shown under the field.
+    error: Option<String>,
+    /// True while the password is being checked in the background.
+    busy: bool,
+}
+
+impl AppGate {
+    /// The gate is up while a sealed library waits for its password.
+    fn for_library(library: &archive_core::Library) -> Option<Self> {
+        (library.encryption() == archive_core::Encryption::Locked).then(|| Self {
+            typed: String::new(),
+            error: None,
+            busy: false,
+        })
+    }
+}
+
+impl std::fmt::Debug for AppGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the typed password, even in a debug trace.
+        f.debug_struct("AppGate")
+            .field("busy", &self.busy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AppGate {
+    fn drop(&mut self) {
+        self.typed.zeroize();
+    }
+}
+
+/// What the app password dialog is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppPasswordMode {
+    /// Choose a password where there is none.
+    Set,
+    /// Replace the password, given the current one.
+    Change,
+    /// Take the password away, given the current one.
+    Remove,
+}
+
+/// The field of the app password dialog that takes typed text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppPasswordField {
+    Current,
+    New,
+    Confirm,
+}
+
+/// The app password dialog on screen. Its typed passwords are wiped when it
+/// goes, whether it was confirmed, cancelled or dismissed.
+#[derive(Clone)]
+pub struct AppPasswordSession {
+    mode: AppPasswordMode,
+    current: String,
+    password: String,
+    confirm: String,
+    field: AppPasswordField,
+    /// Why the last attempt failed, shown under the fields.
+    error: Option<String>,
+    /// True while the change is being checked and saved in the background.
+    busy: bool,
+}
+
+impl AppPasswordSession {
+    /// The fields this mode asks for, in the order Tab moves through them.
+    fn fields(&self) -> &'static [AppPasswordField] {
+        match self.mode {
+            AppPasswordMode::Set => &[AppPasswordField::New, AppPasswordField::Confirm],
+            AppPasswordMode::Change => &[
+                AppPasswordField::Current,
+                AppPasswordField::New,
+                AppPasswordField::Confirm,
+            ],
+            AppPasswordMode::Remove => &[AppPasswordField::Current],
+        }
+    }
+
+    /// The text of the focused field, which is where typing goes.
+    fn typed_mut(&mut self) -> &mut String {
+        match self.field {
+            AppPasswordField::Current => &mut self.current,
+            AppPasswordField::New => &mut self.password,
+            AppPasswordField::Confirm => &mut self.confirm,
+        }
+    }
+
+    fn next_field(&mut self) {
+        let fields = self.fields();
+        let at = fields.iter().position(|f| *f == self.field).unwrap_or(0);
+        self.field = fields[(at + 1) % fields.len()];
+    }
+}
+
+impl std::fmt::Debug for AppPasswordSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the typed passwords, even in a debug trace.
+        f.debug_struct("AppPasswordSession")
+            .field("mode", &self.mode)
+            .field("busy", &self.busy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AppPasswordSession {
+    fn drop(&mut self) {
+        self.current.zeroize();
+        self.password.zeroize();
+        self.confirm.zeroize();
     }
 }
 
@@ -676,6 +829,10 @@ enum MenuAction {
     StartRemoveLock(i64),
     /// Seal an unlocked collection now.
     LockNow(i64),
+    /// Ask for a new name. Not offered while the collection is locked.
+    Rename(i64),
+    /// Add a tag to every item in a collection.
+    TagCollection(i64),
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +935,7 @@ pub struct ArchiveApp {
     search_seq: u64,
     search_inflight: Option<(u64, String)>,
     search_hits: Option<(String, Vec<String>)>,
+    search_semantic_hits: Option<(String, Vec<String>)>,
     semantic: Option<crate::semantic::Semantic>,
     press: Option<Press>,
 
@@ -841,6 +999,10 @@ pub struct ArchiveApp {
     /// Where the menu's card sat last frame, for telling a press on it apart
     /// from a press that dismisses it.
     menu_rect: Rect,
+    /// The app password screen, up while the app is shut. `None` once it is open.
+    gate: Option<AppGate>,
+    /// How far a conversion of the library has got, while one runs.
+    conversion: Option<archive_core::Progress>,
 
     thumbs: ThumbCache,
     previews: ThumbCache,
@@ -888,6 +1050,12 @@ pub struct ArchiveApp {
     details_open: [bool; details::BLOCK_COUNT],
     details_spring: [Spring; details::BLOCK_COUNT],
     details_scroll: f32,
+    /// Cached tags for the item currently shown in the viewer Details panel.
+    tag_item_id: Option<String>,
+    item_tags: Vec<String>,
+    tag_input: String,
+    tag_suggestion: Option<String>,
+    tag_focus: bool,
 
     events_tx: Sender<AppEvent>,
     events_rx: Receiver<AppEvent>,
@@ -936,6 +1104,7 @@ impl ArchiveApp {
             proxy.clone(),
             4,
         ));
+        let gate = AppGate::for_library(&library);
         let mut app = Self {
             renderer: Some(renderer),
             context,
@@ -981,6 +1150,7 @@ impl ArchiveApp {
             search_seq: 0,
             search_inflight: None,
             search_hits: None,
+            search_semantic_hits: None,
             semantic: None,
             press: None,
             hover: None,
@@ -1013,6 +1183,8 @@ impl ArchiveApp {
             toast: None,
             menu: None,
             menu_t: 0.0,
+            gate,
+            conversion: None,
             menu_rect: Rect::default(),
             thumbs: ThumbCache::new(THUMB_CACHE),
             previews: ThumbCache::new(3),
@@ -1044,19 +1216,21 @@ impl ArchiveApp {
             details_open: [false; details::BLOCK_COUNT],
             details_spring: [Spring::at(0.0); details::BLOCK_COUNT],
             details_scroll: 0.0,
+            tag_item_id: None,
+            item_tags: Vec::new(),
+            tag_input: String::new(),
+            tag_suggestion: None,
+            tag_focus: false,
             events_tx,
             events_rx,
             proxy: Some(proxy),
             cursor_hand: false,
             last_error: None,
         };
-        app.reload();
+        if app.gate.is_none() {
+            app.after_unlock();
+        }
         app.observe_theme();
-        app.semantic = crate::semantic::Semantic::start(
-            Arc::clone(&app.library),
-            app.events_tx.clone(),
-            app.proxy.clone(),
-        );
         Ok(app)
     }
 
@@ -1071,6 +1245,7 @@ impl ArchiveApp {
             dream::ui::atlas::AtlasConfig::default(),
         );
         ui.set_theme(&theme);
+        let gate = AppGate::for_library(&library);
         let mut app = Self {
             renderer: None,
             context: None,
@@ -1116,6 +1291,7 @@ impl ArchiveApp {
             search_seq: 0,
             search_inflight: None,
             search_hits: None,
+            search_semantic_hits: None,
             semantic: None,
             press: None,
             hover: None,
@@ -1148,6 +1324,8 @@ impl ArchiveApp {
             toast: None,
             menu: None,
             menu_t: 0.0,
+            gate,
+            conversion: None,
             menu_rect: Rect::default(),
             thumbs: ThumbCache::new(16),
             previews: ThumbCache::new(2),
@@ -1179,6 +1357,11 @@ impl ArchiveApp {
             details_open: [false; details::BLOCK_COUNT],
             details_spring: [Spring::at(0.0); details::BLOCK_COUNT],
             details_scroll: 0.0,
+            tag_item_id: None,
+            item_tags: Vec::new(),
+            tag_input: String::new(),
+            tag_suggestion: None,
+            tag_focus: false,
             events_tx,
             events_rx,
             proxy: None,
@@ -1304,6 +1487,13 @@ impl ArchiveApp {
         if text.is_empty() {
             return;
         }
+        if let Some(gate) = self.gate.as_mut() {
+            if !gate.busy {
+                gate.typed.push_str(&text);
+            }
+            self.dirty = true;
+            return;
+        }
         match &mut self.modal {
             Some(Modal::AddToCollection {
                 name, query, focus, ..
@@ -1320,9 +1510,40 @@ impl ArchiveApp {
                     session.typed_mut().push_str(&text);
                 }
             }
+            Some(Modal::Rename { name, error, .. }) => {
+                name.push_str(&text);
+                *error = None;
+            }
+            Some(Modal::TagCollection {
+                collection,
+                input,
+                suggestion,
+                error,
+                ..
+            }) => {
+                input.push_str(&text);
+                *error = None;
+                *suggestion = self
+                    .library
+                    .suggest_tag(input, None, Some(*collection))
+                    .ok()
+                    .flatten();
+            }
+            Some(Modal::AppPassword(session)) => {
+                if !session.busy {
+                    session.typed_mut().push_str(&text);
+                }
+            }
             Some(_) => {}
             None => {
-                if self.search_focus {
+                if self.viewer.is_some() && self.tag_focus {
+                    self.tag_input.push_str(&text);
+                    self.tag_suggestion = self
+                        .library
+                        .suggest_tag(&self.tag_input, self.tag_item_id.as_deref(), None)
+                        .ok()
+                        .flatten();
+                } else if self.search_focus {
                     self.search.push_str(&text);
                     self.filter_display();
                 }
@@ -1348,6 +1569,12 @@ impl ArchiveApp {
             return;
         }
         self.dirty = true;
+
+        // The app password screen takes Enter and Backspace, and nothing else.
+        if self.gate.is_some() {
+            self.gate_key(key);
+            return;
+        }
 
         // A context menu takes the keys first: Escape and the arrows steer it,
         // and Enter chooses. Any other key dismisses it, then does its own work.
@@ -1385,11 +1612,68 @@ impl ArchiveApp {
         if let Some(modal) = &mut self.modal {
             match key {
                 Key::Escape => self.modal = None,
+                Key::Backspace if matches!(modal, Modal::Rename { .. }) => {
+                    if let Modal::Rename { name, error, .. } = modal {
+                        name.pop();
+                        *error = None;
+                    }
+                }
+                Key::Backspace if matches!(modal, Modal::TagCollection { .. }) => {
+                    if let Modal::TagCollection {
+                        collection,
+                        input,
+                        suggestion,
+                        error,
+                        ..
+                    } = modal
+                    {
+                        input.pop();
+                        *error = None;
+                        *suggestion = self
+                            .library
+                            .suggest_tag(input, None, Some(*collection))
+                            .ok()
+                            .flatten();
+                    }
+                }
+                Key::Tab if matches!(modal, Modal::TagCollection { .. }) => {
+                    if let Modal::TagCollection {
+                        collection,
+                        input,
+                        suggestion,
+                        error,
+                        ..
+                    } = modal
+                        && let Some(suggested) = suggestion.clone()
+                    {
+                        *input = suggested;
+                        *error = None;
+                        *suggestion = self
+                            .library
+                            .suggest_tag(input, None, Some(*collection))
+                            .ok()
+                            .flatten();
+                    }
+                }
+                Key::Backspace if matches!(modal, Modal::AppPassword(_)) => {
+                    if let Modal::AppPassword(session) = modal
+                        && !session.busy
+                    {
+                        session.typed_mut().pop();
+                    }
+                }
                 Key::Backspace if matches!(modal, Modal::Password(_)) => {
                     if let Modal::Password(session) = modal
                         && !session.busy
                     {
                         session.typed_mut().pop();
+                    }
+                }
+                Key::Tab if matches!(modal, Modal::AppPassword(_)) => {
+                    if let Modal::AppPassword(session) = modal
+                        && !session.busy
+                    {
+                        session.next_field();
                     }
                 }
                 Key::Tab => {
@@ -1431,6 +1715,36 @@ impl ArchiveApp {
         }
 
         if let Some(viewer) = &mut self.viewer {
+            if self.tag_focus {
+                match key {
+                    Key::Escape => {
+                        self.tag_focus = false;
+                    }
+                    Key::Backspace => {
+                        self.tag_input.pop();
+                        self.tag_suggestion = self
+                            .library
+                            .suggest_tag(&self.tag_input, self.tag_item_id.as_deref(), None)
+                            .ok()
+                            .flatten();
+                    }
+                    Key::Tab => {
+                        if let Some(suggested) = self.tag_suggestion.clone() {
+                            self.tag_input = suggested;
+                            self.tag_suggestion = self
+                                .library
+                                .suggest_tag(&self.tag_input, self.tag_item_id.as_deref(), None)
+                                .ok()
+                                .flatten();
+                        }
+                    }
+                    Key::Enter => {
+                        self.add_tag_to_current_item();
+                    }
+                    _ => {}
+                }
+                return;
+            }
             match key {
                 Key::Escape => viewer.closing = true,
                 Key::Left if self.input.shift => self.viewer_seek(-SEEK_STEP_MS),
@@ -1601,6 +1915,10 @@ impl ArchiveApp {
     }
 
     pub fn import(&mut self, paths: Vec<PathBuf>) {
+        // Nothing comes in while the app is shut.
+        if self.gate.is_some() {
+            return;
+        }
         self.import_staged(paths, None);
     }
 
@@ -1936,6 +2254,7 @@ impl ArchiveApp {
         // allocating a fresh copy of the catalogue on every keystroke.
         if query.is_empty() {
             self.search_hits = None;
+            self.search_semantic_hits = None;
             self.search_items.clear();
             self.display.clear();
             self.display.extend_from_slice(&self.items);
@@ -1947,20 +2266,29 @@ impl ArchiveApp {
             let ranked = self
                 .search_hits
                 .as_ref()
-                .is_some_and(|(hit, _)| hit.eq_ignore_ascii_case(&query));
+                .is_some_and(|(hit, _)| hit == &query);
             if ranked {
                 // Search results are fetched by id, so a search sees every
                 // item in the library, not only the loaded timeline page.
                 self.display.clear();
                 self.display.extend_from_slice(&self.search_items);
             } else {
-                let in_flight = self
-                    .search_inflight
-                    .as_ref()
-                    .is_some_and(|(_, sent)| sent.eq_ignore_ascii_case(&query));
-                needs_search = !in_flight;
-                // Hold the last results until the new ones land. Blanking the
-                // grid on every keystroke makes the whole page strobe.
+                // Immediately filter to case-sensitive tag matches so the
+                // unfiltered library never stays on screen while searching.
+                let tag_ids = self.library.search_items_by_tag(&query).unwrap_or_default();
+                let items = self.items_by_ranked_ids(&tag_ids);
+                if self.semantic.is_none() {
+                    self.search_items = items.clone();
+                    self.search_hits = Some((query.clone(), tag_ids));
+                } else {
+                    let in_flight = self
+                        .search_inflight
+                        .as_ref()
+                        .is_some_and(|(_, sent)| sent == &query);
+                    needs_search = !in_flight;
+                }
+                self.display.clear();
+                self.display.extend(items);
             }
         }
         if needs_search {
@@ -2042,20 +2370,24 @@ impl ArchiveApp {
     }
 
     /// The collections the Collections page should show. With no query that is
-    /// every collection; otherwise a collection matches when its own name
-    /// contains the query, or when any image inside it does. Images are matched
-    /// the same way the Media page matches them: a date query against capture
-    /// dates, anything else through the semantic index.
+    /// every collection; otherwise a collection matches when its own tags match
+    /// (case-sensitive, prioritized), its own name contains the query, or an
+    /// item inside it matches by date or semantic search. Collection tags are
+    /// independent of child item tags.
     fn matching_collections(&mut self, query: &str) -> Vec<Collection> {
         let query = query.trim();
         if query.is_empty() {
             return self.collections.clone();
         }
         let needle = query.to_lowercase();
+        let tag_ranked = self
+            .library
+            .search_collections_by_tag(query)
+            .unwrap_or_default();
+        let tag_set: HashSet<i64> = tag_ranked.iter().copied().collect();
+
         let mut matched_collections: HashSet<i64> = HashSet::new();
         let item_ids: Vec<String> = if is_date_query(query) {
-            // The display already holds the date matches when a timeline is
-            // on screen; the Albums page has none and asks the catalogue.
             if self.timeline_filter().is_some() {
                 self.display.iter().map(|item| item.id.clone()).collect()
             } else {
@@ -2065,9 +2397,13 @@ impl ArchiveApp {
                     .collect()
             }
         } else {
-            self.search_hits
+            // Only a semantic hit inside a collection lifts it. A plain tag
+            // search matches the collection's own tags below; child item tags
+            // must not make their collections appear, since collection tags
+            // are independent of the tags on their children.
+            self.search_semantic_hits
                 .as_ref()
-                .filter(|(hit, _)| hit.eq_ignore_ascii_case(query))
+                .filter(|(hit, _)| hit == query)
                 .map(|(_, ids)| ids.clone())
                 .unwrap_or_default()
         };
@@ -2076,14 +2412,46 @@ impl ArchiveApp {
         {
             matched_collections.extend(collections);
         }
-        self.collections
-            .iter()
-            .filter(|collection| {
-                collection.name.to_lowercase().contains(&needle)
-                    || matched_collections.contains(&collection.id)
-            })
-            .cloned()
-            .collect()
+
+        let by_id: HashMap<i64, &Collection> =
+            self.collections.iter().map(|c| (c.id, c)).collect();
+        let mut out: Vec<Collection> = Vec::new();
+        for id in &tag_ranked {
+            if let Some(c) = by_id.get(id) {
+                out.push((*c).clone());
+            }
+        }
+        let mut name_matches: Vec<Collection> = Vec::new();
+        let mut item_matches: Vec<Collection> = Vec::new();
+        for collection in &self.collections {
+            if tag_set.contains(&collection.id) {
+                continue;
+            }
+            if collection.name.to_lowercase().contains(&needle) {
+                name_matches.push(collection.clone());
+            } else if matched_collections.contains(&collection.id) {
+                item_matches.push(collection.clone());
+            }
+        }
+        out.extend(name_matches);
+        out.extend(item_matches);
+        out
+    }
+
+    /// Combines case-sensitive tag matches (first) with semantic matches (deduplicated).
+    fn merge_tag_search(&self, query: &str, semantic_ids: &[String]) -> Vec<String> {
+        let tag_ids = self.library.search_items_by_tag(query).unwrap_or_default();
+        if tag_ids.is_empty() {
+            return semantic_ids.to_vec();
+        }
+        let mut seen: HashSet<String> = tag_ids.iter().cloned().collect();
+        let mut merged = tag_ids;
+        for id in semantic_ids {
+            if seen.insert(id.clone()) {
+                merged.push(id.clone());
+            }
+        }
+        merged
     }
 
     fn schedule_search(&mut self) {
@@ -2103,7 +2471,7 @@ impl ArchiveApp {
         if self
             .search_inflight
             .as_ref()
-            .is_some_and(|(_, sent)| sent.eq_ignore_ascii_case(&query))
+            .is_some_and(|(_, sent)| sent == &query)
         {
             return;
         }
@@ -2120,6 +2488,7 @@ impl ArchiveApp {
         self.search_seq += 1;
         self.search_inflight = None;
         self.search_hits = None;
+        self.search_semantic_hits = None;
         self.search_pending = false;
         self.filter_display();
     }
@@ -2133,7 +2502,7 @@ impl ArchiveApp {
             && !self
                 .search_hits
                 .as_ref()
-                .is_some_and(|(hit, _)| hit.eq_ignore_ascii_case(query))
+                .is_some_and(|(hit, _)| hit == query)
     }
 
     fn invalidate_grid(&mut self) {
@@ -2238,6 +2607,11 @@ impl ArchiveApp {
                 AppEvent::ImportDone(report) => self.on_import_done(report),
                 AppEvent::ImportDiscarded(result) => self.on_import_discarded(result),
                 AppEvent::Vault(done) => self.on_vault_done(done),
+                AppEvent::AppLock(done) => self.on_app_lock_done(done),
+                AppEvent::LibraryProgress(progress) => {
+                    self.conversion = Some(progress);
+                    self.dirty = true;
+                }
                 AppEvent::Texture {
                     key,
                     id,
@@ -2277,8 +2651,10 @@ impl ArchiveApp {
                         if let Some((_, query)) = self.search_inflight.take() {
                             // An item locked since the index was read must not come back as a hit.
                             let ids = self.library.visible_ids(&ids).unwrap_or_default();
-                            self.search_items = self.items_by_ranked_ids(&ids);
-                            self.search_hits = Some((query, ids));
+                            let merged = self.merge_tag_search(&query, &ids);
+                            self.search_items = self.items_by_ranked_ids(&merged);
+                            self.search_semantic_hits = Some((query.clone(), ids));
+                            self.search_hits = Some((query, merged));
                         }
                         self.filter_display();
                         self.dirty = true;
@@ -3195,7 +3571,6 @@ impl ArchiveApp {
         self.selection.iter().cloned().collect()
     }
 
-    /// Asks before moving `ids` to the trash. Nothing is asked for an empty list.
     /// Asks before a collection's lock is removed. An unlocked collection is
     /// confirmed here, and a locked one asks for its password.
     fn ask_remove_lock(&mut self, id: i64) {
@@ -3211,12 +3586,11 @@ impl ArchiveApp {
         self.modal_t = 0.0;
     }
 
+    /// Asks before moving `ids` to the trash. Nothing is asked for an empty list.
     fn ask_trash(&mut self, ids: Vec<String>) {
         if ids.is_empty() {
             return;
         }
-        // Items inside an unlocked collection cannot go to the trash, since the trash
-        // does not show them. They are deleted for good, after asking.
         if self.in_unlocked_collection() {
             return self.ask_delete(ids);
         }
@@ -3282,9 +3656,6 @@ impl ArchiveApp {
         }
     }
 
-    /// Opens the collection sheet for `ids`. With nothing to pick from yet,
-    /// it starts on the name field, so the first collection is made by adding
-    /// media rather than from a separate create button.
     fn ask_add_to_collection(&mut self, ids: Vec<String>) {
         let skip: HashSet<i64> = self
             .library
@@ -3292,12 +3663,7 @@ impl ArchiveApp {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        // With collections to choose from, typing searches them and the name
-        // field stays hidden behind the plus. With none, the first one is named.
         let creating = sheet_offers(&self.collections, &skip, "").is_empty();
-        // Opening the sheet leaves the search closed, as the Media search is,
-        // and takes focus only after a click. With nothing to pick from, the
-        // name field is the one thing to type into, so it has the focus.
         let focus = if creating {
             SheetField::Name
         } else {
@@ -3322,8 +3688,6 @@ impl ArchiveApp {
         let Some(id) = viewer.ids.get(viewer.index).cloned() else {
             return;
         };
-        // Items inside an unlocked collection are not in the trash page, so they are
-        // deleted for good here, as they are on the trash page.
         let permanent = self.page == Page::Trash || self.in_unlocked_collection();
         self.modal = Some(Modal::Confirm {
             title: if permanent {
@@ -3348,6 +3712,864 @@ impl ArchiveApp {
 
     fn ask_trash_viewer(&mut self) {
         self.ask_delete_viewer();
+    }
+
+    fn ask_rename(&mut self, collection: i64) {
+        let name = self
+            .collections
+            .iter()
+            .find(|c| c.id == collection)
+            .map(|c| c.name.clone())
+            .or_else(|| {
+                self.library
+                    .collections()
+                    .ok()?
+                    .into_iter()
+                    .find(|c| c.id == collection)
+                    .map(|c| c.name)
+            })
+            .unwrap_or_default();
+        self.modal = Some(Modal::Rename {
+            collection,
+            name,
+            error: None,
+        });
+        self.modal_t = 0.0;
+    }
+
+    fn submit_rename(&mut self) {
+        let Some(Modal::Rename {
+            collection, name, ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        match self.library.rename_collection(collection, &name) {
+            Ok(()) => {
+                self.modal = None;
+                self.reload();
+                self.toast("Collection renamed");
+            }
+            Err(error) => {
+                if let Some(Modal::Rename { error: slot, .. }) = self.modal.as_mut() {
+                    *slot = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    fn after_unlock(&mut self) {
+        self.reload();
+        if self.semantic.is_none() && self.proxy.is_some() {
+            self.semantic = crate::semantic::Semantic::start(
+                Arc::clone(&self.library),
+                self.events_tx.clone(),
+                self.proxy.clone(),
+            );
+        }
+    }
+
+    fn gate_key(&mut self, key: dream::ui::widgets::Key) {
+        use dream::ui::widgets::Key;
+        let Some(gate) = self.gate.as_mut() else {
+            return;
+        };
+        if gate.busy {
+            return;
+        }
+        match key {
+            Key::Backspace => {
+                gate.typed.pop();
+                gate.error = None;
+            }
+            Key::Enter => self.submit_gate(),
+            _ => {}
+        }
+    }
+
+    fn submit_gate(&mut self) {
+        let Some(gate) = self.gate.as_mut() else {
+            return;
+        };
+        if gate.busy || gate.typed.is_empty() {
+            return;
+        }
+        gate.busy = true;
+        gate.error = None;
+        let current = std::mem::take(&mut gate.typed);
+        self.start_password_job(crate::worker::AppLockKind::Unlock, current, None);
+    }
+
+    fn ask_app_password(&mut self, mode: AppPasswordMode) {
+        let field = match mode {
+            AppPasswordMode::Set => AppPasswordField::New,
+            AppPasswordMode::Change | AppPasswordMode::Remove => AppPasswordField::Current,
+        };
+        self.modal = Some(Modal::AppPassword(AppPasswordSession {
+            mode,
+            current: String::new(),
+            password: String::new(),
+            confirm: String::new(),
+            field,
+            error: None,
+            busy: false,
+        }));
+        self.modal_t = 0.0;
+    }
+
+    fn submit_app_password(&mut self) {
+        let Some(Modal::AppPassword(session)) = self.modal.as_mut() else {
+            return;
+        };
+        if session.busy {
+            return;
+        }
+        let kind = match session.mode {
+            AppPasswordMode::Set => crate::worker::AppLockKind::Set,
+            AppPasswordMode::Change => crate::worker::AppLockKind::Change,
+            AppPasswordMode::Remove => crate::worker::AppLockKind::Remove,
+        };
+        if matches!(
+            session.mode,
+            AppPasswordMode::Change | AppPasswordMode::Remove
+        ) && session.current.is_empty()
+        {
+            session.error = Some("Enter the current password.".into());
+            return;
+        }
+        if matches!(session.mode, AppPasswordMode::Set | AppPasswordMode::Change) {
+            if session.password.chars().count() < MIN_PASSWORD_CHARS {
+                session.error = Some(format!(
+                    "Use at least {MIN_PASSWORD_CHARS} characters for the password."
+                ));
+                return;
+            }
+            if session.password != session.confirm {
+                session.error = Some("The two passwords do not match.".into());
+                return;
+            }
+        }
+        session.busy = true;
+        session.error = None;
+        let current = std::mem::take(&mut session.current);
+        let new_pw = (!session.password.is_empty()).then(|| std::mem::take(&mut session.password));
+        session.confirm.zeroize();
+        session.confirm.clear();
+        self.start_password_job(kind, current, new_pw);
+    }
+
+    fn start_password_job(
+        &mut self,
+        kind: crate::worker::AppLockKind,
+        current: String,
+        new_password: Option<String>,
+    ) {
+        let library = Arc::clone(&self.library);
+        let events = self.events_tx.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let mut current = current;
+            let mut new_password = new_password;
+            let result = match kind {
+                crate::worker::AppLockKind::Unlock => library
+                    .unlock_library(&current)
+                    .map(|ok| {
+                        if ok {
+                            crate::worker::AppLockReply::Done
+                        } else {
+                            crate::worker::AppLockReply::Wrong
+                        }
+                    })
+                    .map_err(|e| e.to_string()),
+                crate::worker::AppLockKind::Set => {
+                    let pw = new_password.as_deref().unwrap_or("");
+                    library
+                        .set_password(pw, &mut |_| {})
+                        .map(|()| crate::worker::AppLockReply::Done)
+                        .map_err(|e| e.to_string())
+                }
+                crate::worker::AppLockKind::Change => {
+                    let pw = new_password.as_deref().unwrap_or("");
+                    library
+                        .change_password(&current, pw)
+                        .map(|ok| {
+                            if ok {
+                                crate::worker::AppLockReply::Done
+                            } else {
+                                crate::worker::AppLockReply::Wrong
+                            }
+                        })
+                        .map_err(|e| e.to_string())
+                }
+                crate::worker::AppLockKind::Remove => library
+                    .remove_password(&current, &mut |_| {})
+                    .map(|ok| {
+                        if ok {
+                            crate::worker::AppLockReply::Done
+                        } else {
+                            crate::worker::AppLockReply::Wrong
+                        }
+                    })
+                    .map_err(|e| e.to_string()),
+            };
+            current.zeroize();
+            if let Some(pw) = new_password.as_mut() {
+                pw.zeroize();
+            }
+            let _ = events.send(AppEvent::AppLock(crate::worker::AppLockDone {
+                kind,
+                result,
+            }));
+            if let Some(proxy) = proxy {
+                let _ = proxy.send_event(());
+            }
+        });
+    }
+
+    fn on_app_lock_done(&mut self, done: crate::worker::AppLockDone) {
+        use crate::worker::{AppLockKind, AppLockReply};
+        match done.kind {
+            AppLockKind::Unlock => match done.result {
+                Ok(AppLockReply::Done) => {
+                    self.gate = None;
+                    self.after_unlock();
+                }
+                Ok(AppLockReply::Wrong) => {
+                    if let Some(gate) = self.gate.as_mut() {
+                        gate.busy = false;
+                        gate.typed.clear();
+                        gate.error = Some("That is not the password.".into());
+                    }
+                }
+                Err(error) => {
+                    if let Some(gate) = self.gate.as_mut() {
+                        gate.busy = false;
+                        gate.typed.clear();
+                        gate.error = Some(error);
+                    }
+                }
+            },
+            AppLockKind::Set | AppLockKind::Change | AppLockKind::Remove => match done.result {
+                Ok(AppLockReply::Done) => {
+                    self.modal = None;
+                    let msg = match done.kind {
+                        AppLockKind::Set => "App password set",
+                        AppLockKind::Change => "App password changed",
+                        AppLockKind::Remove => "App password removed",
+                        AppLockKind::Unlock => unreachable!(),
+                    };
+                    self.toast(msg);
+                }
+                Ok(AppLockReply::Wrong) => {
+                    if let Some(Modal::AppPassword(session)) = self.modal.as_mut() {
+                        session.busy = false;
+                        session.current.clear();
+                        session.error = Some("That is not the current password.".into());
+                    }
+                }
+                Err(error) => {
+                    if let Some(Modal::AppPassword(session)) = self.modal.as_mut() {
+                        session.busy = false;
+                        session.error = Some(error);
+                    }
+                }
+            },
+        }
+        self.dirty = true;
+    }
+
+    fn busy_text(&self) -> String {
+        "Working…".to_string()
+    }
+
+    fn set_theme_choice(&mut self, choice: ThemeChoice) {
+        self.settings.theme = choice;
+        let _ = self.settings.save();
+        let dark = match choice {
+            ThemeChoice::System => self.system_dark,
+            ThemeChoice::Light => false,
+            ThemeChoice::Dark => true,
+        };
+        self.apply_theme(dark);
+    }
+
+    fn set_optimize_on_import(&mut self, on: bool) {
+        self.settings.optimize_on_import = on;
+        let _ = self.settings.save();
+        self.dirty = true;
+    }
+
+    fn draw_app_gate(&mut self, ui: &mut Ui, width: f32, height: f32) {
+        let Some(gate) = self.gate.as_ref() else {
+            return;
+        };
+        let typed = gate.typed.chars().count();
+        let busy = gate.busy;
+        let error = gate.error.clone();
+        ui.rect(Rect::new(0.0, 0.0, width, height), self.theme.bg);
+        let card_w = 380.0_f32.min(width - 32.0);
+        let card_h = 228.0;
+        let card = Rect::new((width - card_w) * 0.5, (height - card_h) * 0.5, card_w, card_h);
+        ui.paint_round_rect(card, 16.0, self.theme.g1);
+        ui.paint_round_ring(card, 16.0, 1.25, self.modal_outline());
+        self.label_center(
+            ui,
+            Rect::new(card.x, card.y + 24.0, card.w, 24.0),
+            "Forbidden Library is locked",
+            17.0,
+            FontWeight::SemiBold,
+            self.theme.fg,
+        );
+        self.label_center(
+            ui,
+            Rect::new(card.x + 24.0, card.y + 56.0, card.w - 48.0, 20.0),
+            "Enter the app password to open this library.",
+            13.0,
+            FontWeight::Regular,
+            self.theme.muted,
+        );
+        let field = Rect::new(card.x + 28.0, card.y + 98.0, card.w - 56.0, 38.0);
+        ui.paint_round_rect(field, 10.0, self.theme.g2);
+        ui.paint_round_ring(field, 10.0, 1.25, self.theme.fg);
+        // The typed password is shown as dots, never as characters.
+        let (text, color) = if typed == 0 {
+            ("Password".to_string(), self.theme.muted)
+        } else {
+            ("•".repeat(typed), self.theme.fg)
+        };
+        self.label(
+            ui,
+            Rect::new(field.x + 12.0, field.y, field.w - 24.0, field.h),
+            &text,
+            15.0,
+            FontWeight::Regular,
+            color,
+        );
+        let status = if busy {
+            Some(("Checking the password…".to_string(), self.theme.muted))
+        } else {
+            error.map(|error| (error, self.theme.danger))
+        };
+        if let Some((text, color)) = status {
+            self.label_center(
+                ui,
+                Rect::new(card.x + 28.0, card.y + 140.0, card.w - 56.0, 16.0),
+                &text,
+                12.5,
+                FontWeight::Regular,
+                color,
+            );
+        }
+        let button = Rect::new(card.x + 28.0, card.y + 162.0, card.w - 56.0, 38.0);
+        if self.modal_button(ui, button, "Unlock", ModalTone::Primary, !busy) {
+            self.submit_gate();
+        }
+    }
+
+    /// The rename dialog: one field for the name, and the usual pair of buttons.
+    fn draw_rename(&mut self, ui: &mut Ui, width: f32, height: f32, t: f32) {
+        let Some(Modal::Rename { name, error, .. }) = self.modal.clone() else {
+            return;
+        };
+        let card_w = 380.0_f32.min(width - 32.0);
+        let card_h = 186.0;
+        let card = Rect::new(
+            (width - card_w) * 0.5,
+            (height - card_h) * 0.5 + (1.0 - t) * 10.0,
+            card_w,
+            card_h,
+        );
+        ui.paint_round_rect(card, 16.0, self.theme.g1);
+        ui.paint_round_ring(card, 16.0, 1.25, fade(self.modal_outline(), t));
+        self.label_center(
+            ui,
+            Rect::new(card.x, card.y + 22.0, card.w, 24.0),
+            "Rename collection",
+            17.0,
+            FontWeight::SemiBold,
+            fade(self.theme.fg, t),
+        );
+        let field = Rect::new(card.x + 28.0, card.y + 62.0, card.w - 56.0, 38.0);
+        ui.paint_round_rect(field, 10.0, fade(self.theme.g2, t));
+        ui.paint_round_ring(field, 10.0, 1.25, fade(self.theme.fg, t));
+        let (text, color) = if name.is_empty() {
+            ("Name".to_string(), self.theme.muted)
+        } else {
+            (name, self.theme.fg)
+        };
+        self.label(
+            ui,
+            Rect::new(field.x + 12.0, field.y, field.w - 24.0, field.h),
+            &text,
+            15.0,
+            FontWeight::Regular,
+            fade(color, t),
+        );
+        if let Some(error) = error {
+            self.label_center(
+                ui,
+                Rect::new(card.x + 28.0, card.y + 108.0, card.w - 56.0, 18.0),
+                &error,
+                12.5,
+                FontWeight::Regular,
+                fade(self.theme.danger, t),
+            );
+        }
+        let btn_w = 124.0;
+        let pair_x = card.x + (card.w - (btn_w * 2.0 + 8.0)) * 0.5;
+        let cancel = Rect::new(pair_x, card.max().1 - 58.0, btn_w, 38.0);
+        let save = Rect::new(cancel.max().0 + 8.0, cancel.y, btn_w, 38.0);
+        if self.modal_button(ui, cancel, "Cancel", ModalTone::Plain, true) {
+            self.modal = None;
+        }
+        if self.modal_button(ui, save, "Save", ModalTone::Primary, true) {
+            self.submit_rename();
+        }
+        if self.modal.is_some() && self.input.pressed && !card.contains(self.input.mouse) {
+            self.input.pressed = false;
+            self.modal = None;
+        }
+    }
+
+    /// The collection tags dialog: add tags with autocomplete, view existing tags, and remove them.
+    fn draw_tag_collection(&mut self, ui: &mut Ui, width: f32, height: f32, t: f32) {
+        let Some(Modal::TagCollection {
+            collection,
+            name,
+            input,
+            suggestion,
+            tags,
+            error,
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        let card_w = 400.0_f32.min(width - 32.0);
+        let body_w = card_w - 56.0;
+        let font = ui.fonts().resolve(FontWeight::Regular, false);
+        let pill_h = 24.0;
+        let pill_gap = 6.0;
+        let mut pill_layouts: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(tags.len());
+        let mut px = 0.0_f32;
+        let mut py = 0.0_f32;
+        for (i, tag) in tags.iter().enumerate() {
+            let (tw, _) = ui.measure(tag, font, 12.0);
+            let pw = (tw + 30.0).min(body_w);
+            if px > 0.0 && px + pw > body_w {
+                px = 0.0;
+                py += pill_h + pill_gap;
+            }
+            pill_layouts.push((i, px, py, pw));
+            px += pw + pill_gap;
+        }
+        let pills_h = if pill_layouts.is_empty() {
+            20.0
+        } else {
+            (py + pill_h).min(140.0)
+        };
+        let card_h = 186.0 + pills_h;
+        let card = Rect::new(
+            (width - card_w) * 0.5,
+            (height - card_h) * 0.5 + (1.0 - t) * 10.0,
+            card_w,
+            card_h,
+        );
+        ui.paint_round_rect(card, 16.0, self.theme.g1);
+        ui.paint_round_ring(card, 16.0, 1.25, fade(self.modal_outline(), t));
+        self.label_center(
+            ui,
+            Rect::new(card.x + 16.0, card.y + 20.0, card.w - 32.0, 24.0),
+            &format!("Tags · {name}"),
+            17.0,
+            FontWeight::SemiBold,
+            fade(self.theme.fg, t),
+        );
+        let field = Rect::new(card.x + 28.0, card.y + 58.0, body_w, 38.0);
+        self.draw_tag_input(
+            ui,
+            field,
+            &input,
+            suggestion.as_deref(),
+            true,
+            "Add tag… (Tab to complete)",
+            14.5,
+            t,
+        );
+        if let Some(error) = error {
+            self.label_center(
+                ui,
+                Rect::new(card.x + 28.0, card.y + 100.0, body_w, 18.0),
+                &error,
+                12.5,
+                FontWeight::Regular,
+                fade(self.theme.danger, t),
+            );
+        }
+
+        let pills_area = Rect::new(card.x + 28.0, card.y + 114.0, body_w, pills_h);
+        if tags.is_empty() {
+            self.label_center(
+                ui,
+                pills_area,
+                "No tags on this collection yet",
+                12.5,
+                FontWeight::Regular,
+                fade(self.theme.muted, t),
+            );
+        } else {
+            ui.paint_push_clip(pills_area);
+            let mut remove_tag: Option<String> = None;
+            for (i, px, py, pw) in pill_layouts {
+                let tag = &tags[i];
+                let pill = Rect::new(pills_area.x + px, pills_area.y + py, pw, pill_h);
+                if pill.max().1 > pills_area.max().1 {
+                    continue;
+                }
+                ui.paint_round_rect(pill, 12.0, fade(self.theme.g2, t));
+                self.label_ellipsis(
+                    ui,
+                    Rect::new(pill.x + 9.0, pill.y, (pill.w - 26.0).max(8.0), pill.h),
+                    tag,
+                    12.0,
+                    FontWeight::Regular,
+                    fade(self.theme.fg, t),
+                );
+                let close_rect = Rect::new(pill.max().0 - 19.0, pill.y + 5.0, 14.0, 14.0);
+                let close_hover = close_rect.contains(self.input.mouse);
+                paint_icon(
+                    ui,
+                    close_rect.inset(2.0),
+                    AppIcon::Close,
+                    fade(
+                        if close_hover {
+                            self.theme.fg
+                        } else {
+                            self.theme.muted
+                        },
+                        t,
+                    ),
+                );
+                if close_hover {
+                    self.cursor_hand = true;
+                    if self.input.pressed {
+                        self.input.pressed = false;
+                        remove_tag = Some(tag.clone());
+                    }
+                }
+            }
+            ui.paint_pop_clip();
+            if let Some(tag) = remove_tag {
+                self.remove_tag_from_collection_modal(collection, &tag);
+            }
+        }
+
+        let btn_w = 124.0;
+        let pair_x = card.x + (card.w - (btn_w * 2.0 + 8.0)) * 0.5;
+        let done = Rect::new(pair_x, card.max().1 - 56.0, btn_w, 38.0);
+        let add = Rect::new(done.max().0 + 8.0, done.y, btn_w, 38.0);
+        if self.modal_button(ui, done, "Done", ModalTone::Plain, true) {
+            self.modal = None;
+        }
+        if self.modal_button(ui, add, "Add tag", ModalTone::Primary, true) {
+            self.submit_tag_collection();
+        }
+        if self.modal.is_some() && self.input.pressed && !card.contains(self.input.mouse) {
+            self.input.pressed = false;
+            self.modal = None;
+        }
+    }
+
+    /// The app password dialog. Its fields depend on the mode.
+    fn draw_app_password(&mut self, ui: &mut Ui, width: f32, height: f32, t: f32) {
+        let Some(Modal::AppPassword(session)) = self.modal.clone() else {
+            return;
+        };
+        let fields = session.fields();
+        let (title, body, confirm_label) = match session.mode {
+            AppPasswordMode::Set => (
+                "Set an app password",
+                "Every photo, video and the catalogue are encrypted with this password. Nothing can recover it.",
+                "Set password",
+            ),
+            AppPasswordMode::Change => (
+                "Change the app password",
+                "Enter the current password, then the new one.",
+                "Change",
+            ),
+            AppPasswordMode::Remove => (
+                "Remove the app password",
+                "Enter the current password. The app will open without asking.",
+                "Remove",
+            ),
+        };
+        let card_w = 380.0_f32.min(width - 32.0);
+        let card_h = 116.0 + fields.len() as f32 * 48.0 + 72.0;
+        let card = Rect::new(
+            (width - card_w) * 0.5,
+            (height - card_h) * 0.5 + (1.0 - t) * 10.0,
+            card_w,
+            card_h,
+        );
+        ui.paint_round_rect(card, 16.0, self.theme.g1);
+        ui.paint_round_ring(card, 16.0, 1.25, fade(self.modal_outline(), t));
+        self.label_center(
+            ui,
+            Rect::new(card.x, card.y + 22.0, card.w, 24.0),
+            title,
+            17.0,
+            FontWeight::SemiBold,
+            fade(self.theme.fg, t),
+        );
+        let style = self
+            .text_style(ui, 13.0, FontWeight::Regular, fade(self.theme.muted, t))
+            .line_height(1.3)
+            .align(Align::Center);
+        ui.label_wrapped(
+            Rect::new(card.x + 28.0, card.y + 52.0, card.w - 56.0, 56.0),
+            body,
+            style,
+        );
+
+        let field_w = card.w - 56.0;
+        let mut y = card.y + 116.0;
+        for &field in fields {
+            let (placeholder, typed) = match field {
+                AppPasswordField::Current => ("Current password", session.current.chars().count()),
+                AppPasswordField::New => ("New password", session.password.chars().count()),
+                AppPasswordField::Confirm => ("Confirm password", session.confirm.chars().count()),
+            };
+            let rect = Rect::new(card.x + 28.0, y, field_w, 38.0);
+            let focused = session.field == field;
+            ui.paint_round_rect(rect, 10.0, fade(self.theme.g2, t));
+            let outline = if focused {
+                self.theme.fg
+            } else {
+                self.modal_outline()
+            };
+            ui.paint_round_ring(rect, 10.0, 1.25, fade(outline, t));
+            let (text, color) = if typed == 0 {
+                (placeholder.to_string(), self.theme.muted)
+            } else {
+                ("•".repeat(typed), self.theme.fg)
+            };
+            self.label(
+                ui,
+                Rect::new(rect.x + 12.0, rect.y, rect.w - 24.0, rect.h),
+                &text,
+                15.0,
+                FontWeight::Regular,
+                fade(color, t),
+            );
+            if !session.busy && self.input.pressed && rect.contains(self.input.mouse) {
+                self.input.pressed = false;
+                if let Some(Modal::AppPassword(current)) = self.modal.as_mut() {
+                    current.field = field;
+                }
+            }
+            y += 48.0;
+        }
+
+        let status = if session.busy {
+            Some((self.busy_text(), self.theme.muted))
+        } else {
+            session
+                .error
+                .clone()
+                .map(|error| (error, self.theme.danger))
+        };
+        if let Some((text, color)) = status {
+            self.label_center(
+                ui,
+                Rect::new(card.x + 28.0, y - 6.0, field_w, 18.0),
+                &text,
+                12.5,
+                FontWeight::Regular,
+                fade(color, t),
+            );
+        }
+
+        let btn_w = 124.0;
+        let pair_x = card.x + (card.w - (btn_w * 2.0 + 8.0)) * 0.5;
+        let cancel = Rect::new(pair_x, card.max().1 - 58.0, btn_w, 38.0);
+        let confirm_rect = Rect::new(cancel.max().0 + 8.0, cancel.y, btn_w, 38.0);
+        let confirm_label = if session.busy {
+            "Working…"
+        } else {
+            confirm_label
+        };
+        let tone = if session.mode == AppPasswordMode::Remove {
+            ModalTone::Danger
+        } else {
+            ModalTone::Primary
+        };
+        if self.modal_button(ui, cancel, "Cancel", ModalTone::Plain, !session.busy) {
+            self.modal = None;
+        }
+        if self.modal_button(ui, confirm_rect, confirm_label, tone, !session.busy) {
+            self.submit_app_password();
+        }
+        // Clicking away dismisses it, except while the change is being worked on.
+        if self.modal.is_some()
+            && !session.busy
+            && self.input.pressed
+            && !card.contains(self.input.mouse)
+        {
+            self.input.pressed = false;
+            self.modal = None;
+        }
+    }
+
+    /// The settings page. Each row is a title, an optional line under it, and
+    /// its control on the right.
+    fn draw_settings_page(&mut self, ui: &mut Ui, content: Rect) {
+        const ROW_H: f32 = 64.0;
+        const BUTTON_H: f32 = 32.0;
+        const BUTTON_W: f32 = 84.0;
+        const GAP: f32 = 6.0;
+        let x = content.x + 32.0;
+        let w = (content.w - 64.0).clamp(0.0, 640.0);
+        let mut y = content.y + 24.0;
+
+        // Appearance: the theme, as three choices.
+        self.settings_heading(ui, Rect::new(x, y, w, 20.0), "Appearance");
+        y += 28.0;
+        let row = Rect::new(x, y, w, ROW_H);
+        let button_y = row.y + (row.h - BUTTON_H) * 0.5;
+        let choices = [
+            (ThemeChoice::System, "System"),
+            (ThemeChoice::Light, "Light"),
+            (ThemeChoice::Dark, "Dark"),
+        ];
+        let group_w = choices.len() as f32 * BUTTON_W + (choices.len() as f32 - 1.0) * GAP;
+        self.paint_settings_row(ui, row);
+        self.settings_text(ui, row, "Theme", None, group_w + 16.0);
+        let mut bx = row.max().0 - 16.0 - group_w;
+        for (choice, label) in choices {
+            let rect = Rect::new(bx, button_y, BUTTON_W, BUTTON_H);
+            let active = self.settings.theme == choice;
+            if self.settings_button(ui, rect, label, active) {
+                self.set_theme_choice(choice);
+            }
+            bx += BUTTON_W + GAP;
+        }
+
+        // Imports.
+        y += ROW_H + 8.0;
+        let row = Rect::new(x, y, w, ROW_H);
+        let button_y = row.y + (row.h - BUTTON_H) * 0.5;
+        let group_w = BUTTON_W * 2.0 + GAP;
+        self.paint_settings_row(ui, row);
+        self.settings_text(ui, row, "Optimize photos on import", None, group_w + 16.0);
+        let on = self.settings.optimize_on_import;
+        let off_rect = Rect::new(row.max().0 - 16.0 - group_w, button_y, BUTTON_W, BUTTON_H);
+        let on_rect = Rect::new(off_rect.max().0 + GAP, button_y, BUTTON_W, BUTTON_H);
+        if self.settings_button(ui, off_rect, "Off", !on) {
+            self.set_optimize_on_import(false);
+        }
+        if self.settings_button(ui, on_rect, "On", on) {
+            self.set_optimize_on_import(true);
+        }
+
+        // Security: the app password.
+        y += ROW_H + 24.0;
+        self.settings_heading(ui, Rect::new(x, y, w, 20.0), "Security");
+        y += 28.0;
+        let row = Rect::new(x, y, w, ROW_H);
+        let button_y = row.y + (row.h - BUTTON_H) * 0.5;
+        let set = self.library.encryption() != archive_core::Encryption::Plain;
+        let (controls, button_w) = if set {
+            (
+                vec![
+                    ("Change", AppPasswordMode::Change),
+                    ("Remove", AppPasswordMode::Remove),
+                ],
+                BUTTON_W,
+            )
+        } else {
+            (vec![("Set password", AppPasswordMode::Set)], 124.0)
+        };
+        let count = controls.len() as f32;
+        let group_w = count * button_w + (count - 1.0) * GAP;
+        self.paint_settings_row(ui, row);
+        self.settings_text(ui, row, "App password", None, group_w + 16.0);
+        let mut bx = row.max().0 - 16.0 - group_w;
+        for (label, mode) in controls {
+            let rect = Rect::new(bx, button_y, button_w, BUTTON_H);
+            if self.settings_button(ui, rect, label, true) {
+                self.ask_app_password(mode);
+            }
+            bx += button_w + GAP;
+        }
+    }
+
+    fn settings_heading(&mut self, ui: &mut Ui, rect: Rect, text: &str) {
+        self.label(ui, rect, text, 12.5, FontWeight::Regular, self.theme.muted);
+    }
+
+    fn paint_settings_row(&self, ui: &mut Ui, rect: Rect) {
+        ui.paint_round_rect(rect, 14.0, self.theme.g1);
+    }
+
+    /// A row's title, and an optional line under it. The text stops short of
+    /// `controls_w` on the right, where the row's controls sit.
+    fn settings_text(
+        &mut self,
+        ui: &mut Ui,
+        row: Rect,
+        title: &str,
+        detail: Option<&str>,
+        controls_w: f32,
+    ) {
+        let text_w = (row.w - controls_w - 16.0).max(0.0);
+        match detail {
+            Some(detail) => {
+                self.label(
+                    ui,
+                    Rect::new(row.x + 18.0, row.y + 10.0, text_w, 20.0),
+                    title,
+                    14.0,
+                    FontWeight::SemiBold,
+                    self.theme.fg,
+                );
+                let style = self
+                    .text_style(ui, 12.5, FontWeight::Regular, self.theme.muted)
+                    .line_height(1.3);
+                ui.label_wrapped(
+                    Rect::new(row.x + 18.0, row.y + 30.0, text_w, 32.0),
+                    detail,
+                    style,
+                );
+            }
+            None => self.label(
+                ui,
+                Rect::new(row.x + 18.0, row.y + 22.0, text_w, 20.0),
+                title,
+                14.0,
+                FontWeight::SemiBold,
+                self.theme.fg,
+            ),
+        }
+    }
+
+    /// A small button on a settings row. `active` marks the choice in force,
+    /// or, for an action, lights the button up as a button.
+    fn settings_button(&mut self, ui: &mut Ui, rect: Rect, label: &str, active: bool) -> bool {
+        let hovered = self.hovered(rect);
+        if active {
+            ui.paint_round_rect(rect, 10.0, self.theme.g2);
+        } else if hovered {
+            ui.paint_round_rect(rect, 10.0, hover_overlay(self.dark, 0.8));
+        }
+        if hovered {
+            self.cursor_hand = true;
+        }
+        let ink = if active {
+            self.theme.fg
+        } else {
+            self.theme.muted
+        };
+        self.label_center(ui, rect, label, 13.0, FontWeight::SemiBold, ink);
+        self.take_press(rect)
     }
 
     // --- Context menu ---------------------------------------------------
@@ -3415,6 +4637,8 @@ impl ArchiveApp {
         let id = *id;
         match lock {
             LockState::None => vec![
+                MenuRow::item("Tags", AppIcon::Tag, false, MenuAction::TagCollection(id)),
+                MenuRow::item("Rename", AppIcon::Pencil, false, MenuAction::Rename(id)),
                 MenuRow::item(
                     "Lock with a password",
                     AppIcon::Lock,
@@ -3446,6 +4670,8 @@ impl ArchiveApp {
             ],
             LockState::Unlocked => vec![
                 MenuRow::item("Lock now", AppIcon::Lock, false, MenuAction::LockNow(id)),
+                MenuRow::item("Tags", AppIcon::Tag, false, MenuAction::TagCollection(id)),
+                MenuRow::item("Rename", AppIcon::Pencil, false, MenuAction::Rename(id)),
                 MenuRow::item(
                     "Remove the lock",
                     AppIcon::LockOpen,
@@ -3539,6 +4765,8 @@ impl ArchiveApp {
             MenuAction::StartUnlock(id) => self.ask_password(id, PasswordMode::Unlock),
             MenuAction::StartRemoveLock(id) => self.ask_remove_lock(id),
             MenuAction::LockNow(id) => self.lock_now(id),
+            MenuAction::Rename(id) => self.ask_rename(id),
+            MenuAction::TagCollection(id) => self.ask_tag_collection(id),
         }
         self.dirty = true;
     }
@@ -3662,6 +4890,9 @@ impl ArchiveApp {
                 self.run_confirm(action);
             }
             Some(Modal::Password(_)) => self.submit_password(),
+            Some(Modal::Rename { .. }) => self.submit_rename(),
+            Some(Modal::TagCollection { .. }) => self.submit_tag_collection(),
+            Some(Modal::AppPassword(_)) => self.submit_app_password(),
             Some(Modal::Import(ImportSession {
                 phase: ImportPhase::Review,
                 ..
@@ -4315,6 +5546,10 @@ impl ArchiveApp {
         }
         self.cursor_hand = false;
         ui.rect(Rect::new(0.0, 0.0, width, height), self.theme.bg);
+        if self.gate.is_some() {
+            self.draw_app_gate(ui, width, height);
+            return;
+        }
         self.draw_sidebar(ui, height);
         self.draw_topbar(ui, width);
         let content = Rect::new(
@@ -4334,6 +5569,7 @@ impl ArchiveApp {
                     self.draw_media_page(ui, content, alpha, dy);
                 }
                 Page::Albums | Page::Collections => self.draw_cover_grid(ui, content, alpha, dy),
+                Page::Settings => self.draw_settings_page(ui, content),
             }
             ui.paint_pop_clip();
         }
@@ -4401,7 +5637,9 @@ impl ArchiveApp {
             ROW,
             ROW + stretch * 2.0,
         );
-        ui.paint_round_rect(pill, 14.0, self.theme.g2);
+        if self.page != Page::Settings {
+            ui.paint_round_rect(pill, 14.0, self.theme.g2);
+        }
 
         for (index, page) in nav.iter().enumerate() {
             let row = Rect::new(x, start_y + index as f32 * STEP, ROW, ROW);
@@ -4415,6 +5653,23 @@ impl ArchiveApp {
             if self.take_press(row) {
                 self.set_page(page.clone());
             }
+        }
+
+        // Settings stands apart at the foot of the column, so it is not read as a page.
+        let gear = Rect::new(x, height - 18.0 - ROW, ROW, ROW);
+        let on = self.page == Page::Settings;
+        if on {
+            ui.paint_round_rect(gear, 14.0, self.theme.g2);
+        } else if self.hovered(gear) {
+            ui.paint_round_rect(gear, 14.0, hover_overlay(self.dark, 0.8));
+        }
+        if self.hovered(gear) {
+            self.cursor_hand = true;
+        }
+        let ink = if on { self.theme.fg } else { self.theme.muted };
+        paint_icon(ui, center_in(gear, (24.0, 24.0)), AppIcon::Settings, ink);
+        if self.take_press(gear) {
+            self.set_page(Page::Settings);
         }
     }
 
@@ -4671,13 +5926,14 @@ impl ArchiveApp {
                     actions.push(TopAction::DeleteCollection(id));
                 }
             }
+            Page::Settings => {}
             Page::Trash => {
                 if self.stats.trash_items > 0 {
                     actions.push(TopAction::EmptyTrash);
                 }
             }
         }
-        if !matches!(self.page, Page::Trash) {
+        if !matches!(self.page, Page::Trash | Page::Settings) {
             actions.push(TopAction::Search);
         }
         actions
@@ -4792,7 +6048,6 @@ impl ArchiveApp {
         let x = content_x + 26.0;
         let width = (limit - x).max(80.0);
         let open_t = self.opened.x.clamp(0.0, 1.0);
-        let bg = self.theme.bg;
         if matches!(self.page, Page::Album(_) | Page::Collection(_)) {
             self.open_row = nav_row(&self.page) as usize;
         }
@@ -4800,12 +6055,14 @@ impl ArchiveApp {
         ui.paint_push_clip(Rect::new(x, 0.0, width, TOPBAR_H));
         for (index, title) in NAV_TITLES.iter().enumerate() {
             let distance = index as f32 - self.nav.x;
-            let mut ink = bg.mix(self.theme.fg, (1.0 - distance.abs()).clamp(0.0, 1.0));
+            let alpha = nav_title_alpha(distance, index == self.open_row, open_t);
             let mut dy = distance * TITLE_STEP;
             if index == self.open_row {
                 // The nav title rolls away while the open album's name rolls in.
-                ink = ink.mix(bg, open_t);
                 dy -= open_t * TITLE_STEP;
+            }
+            if alpha <= 0.0 {
+                continue;
             }
             self.label(
                 ui,
@@ -4813,7 +6070,7 @@ impl ArchiveApp {
                 title,
                 TITLE_SIZE,
                 FontWeight::Regular,
-                ink,
+                fade(self.theme.fg, alpha),
             );
         }
 
@@ -4822,15 +6079,17 @@ impl ArchiveApp {
         // the page names: vertical motion only, never a diagonal drift.
         let roll = name_roll(self.open_row as f32, self.nav.x, open_t);
         let name_x = x + 40.0;
-        let name_ink = bg.mix(self.theme.fg, open_t);
-        self.label_ellipsis(
-            ui,
-            Rect::new(name_x, roll, (limit - name_x).max(80.0), TOPBAR_H),
-            &self.open_title,
-            TITLE_SIZE,
-            FontWeight::Regular,
-            name_ink,
-        );
+        let name_ink = fade(self.theme.fg, open_t);
+        if open_t > 0.0 {
+            self.label_ellipsis(
+                ui,
+                Rect::new(name_x, roll, (limit - name_x).max(80.0), TOPBAR_H),
+                &self.open_title,
+                TITLE_SIZE,
+                FontWeight::Regular,
+                name_ink,
+            );
+        }
         ui.paint_pop_clip();
 
         // The back arrow rides the same drum: it rolls in below the name when
@@ -5919,7 +7178,23 @@ impl ArchiveApp {
     /// Choose the engine for `item` and start it. Players return at once and
     /// load on their own threads.
     fn open_media(&self, item: &Item, now: Instant) -> MediaView {
-        let path = self.library.source_path(item);
+        // Video, music and animations stream from a path. For a sealed library
+        // that path is a decrypted copy, which the view keeps for as long as the
+        // player runs. Stills are decoded from memory and need no copy.
+        let streams = matches!(item.kind, Kind::Video | Kind::Audio)
+            || (item.kind == Kind::Image && is_animated_ext(&item.ext));
+        let source = if streams {
+            match self.library.plain_source(item) {
+                Ok(plain) => Some(plain),
+                Err(_) => return MediaView::new(item.id.clone(), Playback::Still, now),
+            }
+        } else {
+            None
+        };
+        let path = source
+            .as_ref()
+            .map(|plain| plain.path().to_path_buf())
+            .unwrap_or_default();
         let wake = self.wake();
         let (width, height) = self.media_pixels();
         let playback = match item.kind {
@@ -5942,7 +7217,9 @@ impl ArchiveApp {
             }
             _ => Playback::Still,
         };
-        MediaView::new(item.id.clone(), playback, now)
+        let mut view = MediaView::new(item.id.clone(), playback, now);
+        view.source = source;
+        view
     }
 
     /// Start the media for the open item and reset what belonged to the one
@@ -7231,6 +8508,234 @@ impl ArchiveApp {
         }
     }
 
+    fn ask_tag_collection(&mut self, id: i64) {
+        let Some(name) = self
+            .collections
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name.clone())
+            .or_else(|| {
+                self.library
+                    .collections()
+                    .ok()?
+                    .into_iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.name)
+            })
+        else {
+            return;
+        };
+        let tags = self.library.collection_tags(id).unwrap_or_default();
+        self.modal = Some(Modal::TagCollection {
+            collection: id,
+            name,
+            input: String::new(),
+            suggestion: None,
+            tags,
+            error: None,
+        });
+    }
+
+    fn submit_tag_collection(&mut self) {
+        let Some(Modal::TagCollection {
+            collection, input, ..
+        }) = self.modal.clone()
+        else {
+            return;
+        };
+        let tag = input.trim().to_string();
+        if tag.is_empty() {
+            if let Some(Modal::TagCollection { error, .. }) = self.modal.as_mut() {
+                *error = Some("Enter a tag.".into());
+            }
+            return;
+        }
+        match self.library.add_collection_tag(collection, &tag) {
+            Ok(added) => {
+                let updated_tags = self.library.collection_tags(collection).unwrap_or_default();
+                if let Some(Modal::TagCollection {
+                    input,
+                    suggestion,
+                    tags,
+                    error,
+                    ..
+                }) = self.modal.as_mut()
+                {
+                    input.clear();
+                    *suggestion = None;
+                    *tags = updated_tags;
+                    *error = None;
+                }
+                self.toast(if added {
+                    "Tag added to collection"
+                } else {
+                    "Collection already has that tag"
+                });
+                if !self.search.trim().is_empty() {
+                    self.filter_display();
+                }
+            }
+            Err(err) => {
+                if let Some(Modal::TagCollection { error, .. }) = self.modal.as_mut() {
+                    *error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn remove_tag_from_collection_modal(&mut self, collection: i64, tag: &str) {
+        match self.library.remove_collection_tag(collection, tag) {
+            Ok(_) => {
+                let updated_tags = self.library.collection_tags(collection).unwrap_or_default();
+                if let Some(Modal::TagCollection { tags, error, .. }) = self.modal.as_mut() {
+                    *tags = updated_tags;
+                    *error = None;
+                }
+                if !self.search.trim().is_empty() {
+                    self.filter_display();
+                }
+            }
+            Err(err) => {
+                if let Some(Modal::TagCollection { error, .. }) = self.modal.as_mut() {
+                    *error = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    fn sync_item_tags(&mut self, item_id: Option<&str>) {
+        if self.tag_item_id.as_deref() == item_id {
+            return;
+        }
+        self.tag_item_id = item_id.map(str::to_string);
+        self.item_tags = item_id
+            .and_then(|id| self.library.item_tags(id).ok())
+            .unwrap_or_default();
+        self.tag_input.clear();
+        self.tag_suggestion = None;
+        self.tag_focus = false;
+    }
+
+    fn add_tag_to_current_item(&mut self) {
+        let tag = self.tag_input.trim().to_string();
+        let Some(id) = self.viewer.as_ref().and_then(|v| v.ids.get(v.index)).cloned() else {
+            return;
+        };
+        if tag.is_empty() {
+            return;
+        }
+        match self.library.add_item_tag(&id, &tag) {
+            Ok(_) => {
+                self.item_tags = self.library.item_tags(&id).unwrap_or_default();
+                self.tag_input.clear();
+                self.tag_suggestion = None;
+                if !self.search.trim().is_empty() {
+                    self.search_hits = None;
+                    self.filter_display();
+                }
+            }
+            Err(err) => self.toast(&err.to_string()),
+        }
+    }
+
+    fn remove_tag_from_current_item(&mut self, tag: &str) {
+        let Some(id) = self.viewer.as_ref().and_then(|v| v.ids.get(v.index)).cloned() else {
+            return;
+        };
+        match self.library.remove_item_tag(&id, tag) {
+            Ok(_) => {
+                self.item_tags = self.library.item_tags(&id).unwrap_or_default();
+                if !self.search.trim().is_empty() {
+                    self.search_hits = None;
+                    self.filter_display();
+                }
+            }
+            Err(err) => self.toast(&err.to_string()),
+        }
+    }
+
+    /// Draws a single-line tag input field with grey inline autocomplete text.
+    fn draw_tag_input(
+        &self,
+        ui: &mut Ui,
+        field: Rect,
+        text: &str,
+        suggestion: Option<&str>,
+        focused: bool,
+        placeholder: &str,
+        font_size: f32,
+        alpha: f32,
+    ) {
+        ui.paint_round_rect(field, 10.0, fade(self.theme.g1, alpha));
+        let ring = if focused {
+            self.theme.fg
+        } else {
+            self.theme.g3
+        };
+        ui.paint_round_ring(field, 10.0, 1.25, fade(ring, alpha));
+
+        let text_x = field.x + 12.0;
+        let avail = (field.w - 24.0).max(4.0);
+        let font = ui.fonts().resolve(FontWeight::Regular, false);
+        ui.paint_push_clip(Rect::new(text_x, field.y, avail, field.h));
+
+        let mut caret_x = text_x;
+        if text.is_empty() {
+            if !focused {
+                self.label(
+                    ui,
+                    Rect::new(text_x, field.y, avail, field.h),
+                    placeholder,
+                    font_size,
+                    FontWeight::Regular,
+                    fade(self.theme.muted, alpha),
+                );
+            }
+        } else {
+            let (typed_w, _) = ui.measure(text, font, font_size);
+            let suffix = suggestion
+                .filter(|s| s.starts_with(text) && s.len() > text.len())
+                .map(|s| &s[text.len()..]);
+            let suffix_w = suffix.map(|s| ui.measure(s, font, font_size).0).unwrap_or(0.0);
+            let total_w = typed_w + suffix_w;
+            let shift = (typed_w - avail).max(0.0);
+
+            self.label(
+                ui,
+                Rect::new(text_x - shift, field.y, total_w.max(avail), field.h),
+                text,
+                font_size,
+                FontWeight::Regular,
+                fade(self.theme.fg, alpha),
+            );
+            if let Some(suffix) = suffix {
+                self.label(
+                    ui,
+                    Rect::new(
+                        text_x - shift + typed_w,
+                        field.y,
+                        suffix_w.max(avail),
+                        field.h,
+                    ),
+                    suffix,
+                    font_size,
+                    FontWeight::Regular,
+                    fade(self.theme.muted, alpha),
+                );
+            }
+            caret_x = text_x + typed_w - shift + 1.0;
+        }
+        if focused && self.time % 1.06 < 0.58 {
+            let caret_h = (font_size + 4.0).min(field.h - 10.0);
+            ui.paint_round_rect(
+                Rect::new(caret_x, field.y + (field.h - caret_h) * 0.5, 1.5, caret_h),
+                0.75,
+                fade(self.theme.fg, alpha),
+            );
+        }
+        ui.paint_pop_clip();
+    }
+
     /// The Details panel: summary blocks that drop down to their facts. `info`
     /// is how far the panel is shown, and sets its opacity. Each block opens on
     /// its own spring. The list scrolls with the wheel. Returns true when the
@@ -7244,6 +8749,7 @@ impl ArchiveApp {
         interactive: bool,
     ) -> bool {
         let mut handled = false;
+        self.sync_item_tags(item.map(|it| it.id.as_str()));
         ui.paint_round_rect(panel, 14.0, fade(self.theme.g1, info));
         ui.paint_push_clip(panel);
         let inner_x = panel.x + 20.0;
@@ -7252,9 +8758,41 @@ impl ArchiveApp {
         let blocks = item
             .map(|item| details::blocks(item, audio.as_ref()))
             .unwrap_or_default();
+
+        // Lay out tag pills ahead of time so the Tags card height is exact.
+        let font = ui.fonts().resolve(FontWeight::Regular, false);
+        let mut pill_layouts: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(self.item_tags.len());
+        let mut px = 0.0_f32;
+        let mut py = 0.0_f32;
+        let pill_h = 24.0;
+        let pill_gap = 6.0;
+        for (i, tag) in self.item_tags.iter().enumerate() {
+            let (tw, _) = ui.measure(tag, font, 12.0);
+            let pw = (tw + 30.0).min(DETAILS_BODY_W);
+            if px > 0.0 && px + pw > DETAILS_BODY_W {
+                px = 0.0;
+                py += pill_h + pill_gap;
+            }
+            pill_layouts.push((i, px, py, pw));
+            px += pw + pill_gap;
+        }
+        let pills_h = if pill_layouts.is_empty() {
+            0.0
+        } else {
+            py + pill_h
+        };
+        let tags_card_h = if item.is_some() {
+            CARD_HEAD_H
+                + 34.0
+                + if pills_h > 0.0 { 10.0 + pills_h } else { 0.0 }
+                + 14.0
+        } else {
+            0.0
+        };
+
         // The blocks start at the top of the panel now that the name is above the image.
         let list = Rect::new(panel.x, panel.y + 20.0, panel.w, (panel.h - 32.0).max(0.0));
-        let total: f32 = blocks
+        let blocks_total: f32 = blocks
             .iter()
             .enumerate()
             .map(|(index, block)| {
@@ -7263,6 +8801,12 @@ impl ArchiveApp {
                 CARD_HEAD_H + drop_height(body) * open + CARD_GAP
             })
             .sum();
+        let total = blocks_total
+            + if tags_card_h > 0.0 {
+                tags_card_h + CARD_GAP
+            } else {
+                0.0
+            };
         let max_scroll = (total - list.h).max(0.0);
         if interactive && list.contains(self.input.mouse) {
             let delta = self.input.wheel + self.input.precise;
@@ -7274,6 +8818,107 @@ impl ArchiveApp {
 
         ui.paint_push_clip(list);
         let mut y = list.y - self.details_scroll;
+        if item.is_some() {
+            let card = Rect::new(inner_x, y, DETAILS_INNER_W, tags_card_h);
+            ui.paint_round_rect(card, 14.0, fade(self.theme.g2, info));
+            paint_icon(
+                ui,
+                Rect::new(card.x + 14.0, card.y + 16.0, 20.0, 20.0),
+                AppIcon::Tag,
+                fade(self.theme.fg, info),
+            );
+            let text_x = card.x + 46.0;
+            let text_w = (card.max().0 - 16.0 - text_x).max(40.0);
+            let summary = if self.item_tags.is_empty() {
+                "Type a tag, Tab to complete, Enter to add".to_string()
+            } else {
+                count_label(self.item_tags.len() as i64, "tag")
+            };
+            self.label_ellipsis(
+                ui,
+                Rect::new(text_x, card.y + 8.0, text_w, 18.0),
+                "Tags",
+                14.0,
+                FontWeight::Medium,
+                fade(self.theme.fg, info),
+            );
+            self.label_ellipsis(
+                ui,
+                Rect::new(text_x, card.y + 27.0, text_w, 16.0),
+                &summary,
+                12.0,
+                FontWeight::Regular,
+                fade(self.theme.muted, info),
+            );
+
+            let input_rect = Rect::new(card.x + 12.0, card.y + CARD_HEAD_H, DETAILS_BODY_W, 34.0);
+            self.draw_tag_input(
+                ui,
+                input_rect,
+                &self.tag_input,
+                self.tag_suggestion.as_deref(),
+                self.tag_focus,
+                "Add tag…",
+                13.0,
+                info,
+            );
+            if interactive && list.contains(self.input.mouse) && input_rect.contains(self.input.mouse)
+            {
+                self.cursor_hand = true;
+                if self.input.pressed {
+                    self.input.pressed = false;
+                    self.tag_focus = true;
+                    self.dirty = true;
+                    handled = true;
+                }
+            }
+
+            let mut remove_tag: Option<String> = None;
+            let pills_y = input_rect.max().1 + 10.0;
+            for (i, px, py, pw) in pill_layouts {
+                let tag = &self.item_tags[i];
+                let pill = Rect::new(card.x + 12.0 + px, pills_y + py, pw, pill_h);
+                ui.paint_round_rect(pill, 12.0, fade(self.theme.g3, info));
+                self.label_ellipsis(
+                    ui,
+                    Rect::new(pill.x + 9.0, pill.y, (pill.w - 26.0).max(8.0), pill.h),
+                    tag,
+                    12.0,
+                    FontWeight::Regular,
+                    fade(self.theme.fg, info),
+                );
+                let close_rect = Rect::new(pill.max().0 - 19.0, pill.y + 5.0, 14.0, 14.0);
+                let close_hover = interactive
+                    && list.contains(self.input.mouse)
+                    && close_rect.contains(self.input.mouse);
+                paint_icon(
+                    ui,
+                    close_rect.inset(2.0),
+                    AppIcon::Close,
+                    fade(
+                        if close_hover {
+                            self.theme.fg
+                        } else {
+                            self.theme.muted
+                        },
+                        info,
+                    ),
+                );
+                if close_hover {
+                    self.cursor_hand = true;
+                    if self.input.pressed {
+                        self.input.pressed = false;
+                        remove_tag = Some(tag.clone());
+                        handled = true;
+                    }
+                }
+            }
+            if let Some(tag) = remove_tag {
+                self.remove_tag_from_current_item(&tag);
+                self.dirty = true;
+            }
+            y += tags_card_h + CARD_GAP;
+        }
         for (index, block) in blocks.iter().enumerate() {
             let open = self.details_spring[index].x.clamp(0.0, 1.0);
             let expandable = block.available && !block.fields.is_empty();
@@ -7392,8 +9037,11 @@ impl ArchiveApp {
             && self.modal.is_none()
             && self.menu.is_none()
         {
+            self.tag_focus = false;
             self.input.pressed = false;
             handled = true;
+        } else if interactive && self.input.pressed && !panel.contains(self.input.mouse) {
+            self.tag_focus = false;
         }
         handled
     }
@@ -7707,6 +9355,9 @@ impl ArchiveApp {
             Some(Modal::AddToCollection { .. }) => self.draw_collection_sheet(ui, width, height, t),
             Some(Modal::Import(_)) => self.draw_import_sheet(ui, width, height, t),
             Some(Modal::Password(_)) => self.draw_password(ui, width, height, t),
+            Some(Modal::Rename { .. }) => self.draw_rename(ui, width, height, t),
+            Some(Modal::TagCollection { .. }) => self.draw_tag_collection(ui, width, height, t),
+            Some(Modal::AppPassword(_)) => self.draw_app_password(ui, width, height, t),
             _ => self.draw_confirm(ui, width, height, t),
         }
         // A dismissal during drawing has already painted the modal this frame.
@@ -9312,6 +10963,42 @@ mod tests {
     }
 
     #[test]
+    fn settings_is_the_last_stop_on_the_page_name_revolver() {
+        let target = super::nav_row(&Page::Settings);
+        assert_eq!(super::NAV_TITLES[target as usize], "Settings");
+        for source in 0..4 {
+            let start = source as f32;
+            let halfway = start + (target - start) * 0.5;
+            let start_y = (target - start) * TITLE_STEP;
+            let halfway_y = (target - halfway) * TITLE_STEP;
+            assert!(
+                start_y > 0.0,
+                "source row {source} starts below the title slot"
+            );
+            assert!(halfway_y > 0.0 && halfway_y < start_y);
+        }
+    }
+
+    #[test]
+    fn revolver_titles_use_alpha_for_nav_and_open_page_fades() {
+        // At the midpoint between stops, both titles remain translucent and
+        // cannot paint background-colored glyphs over each other.
+        assert_eq!(super::nav_title_alpha(-0.5, false, 0.0), 0.5);
+        assert_eq!(super::nav_title_alpha(0.5, false, 0.0), 0.5);
+        assert_eq!(super::nav_title_alpha(-1.0, false, 0.0), 0.0);
+
+        // Opening or closing (including a reversal at any spring position)
+        // only changes opacity; no title gains opaque background pixels.
+        for open_t in [0.0, 0.2, 0.5, 0.8, 1.0] {
+            let row = super::nav_title_alpha(0.0, true, open_t);
+            let name = open_t.clamp(0.0, 1.0);
+            assert!((row + name - 1.0).abs() < 1e-6);
+            assert!((0.0..=1.0).contains(&row));
+            assert!((0.0..=1.0).contains(&name));
+        }
+    }
+
+    #[test]
     fn import_source_picker_and_qr_scrim_cancel_without_leaving_a_listener() {
         let temp = tempfile::tempdir().unwrap();
         let mut app = ArchiveApp::headless(temp.path().to_path_buf(), Settings::default()).unwrap();
@@ -10297,7 +11984,10 @@ mod tests {
         );
 
         // A semantic hit for an image inside Work lifts Work, not Trip.
+        // A finished semantic search records both the raw semantic ids and
+        // the merged (tag + semantic) ranking, so simulate both here.
         app.search = "a red square".into();
+        app.search_semantic_hits = Some(("a red square".into(), vec![ids[1].clone()]));
         app.search_hits = Some(("a red square".into(), vec![ids[1].clone()]));
         app.filter_display();
         assert_eq!(
@@ -10760,7 +12450,12 @@ mod tests {
                 &Page::Collection(7),
                 LockState::None
             )),
-            vec![MenuAction::StartLock(7), MenuAction::DeleteCollection(7)]
+            vec![
+                MenuAction::TagCollection(7),
+                MenuAction::Rename(7),
+                MenuAction::StartLock(7),
+                MenuAction::DeleteCollection(7)
+            ]
         );
         // A locked collection cannot be deleted: its items would be lost with it.
         assert_eq!(
@@ -10777,12 +12472,158 @@ mod tests {
             )),
             vec![
                 MenuAction::LockNow(7),
+                MenuAction::TagCollection(7),
+                MenuAction::Rename(7),
                 MenuAction::StartRemoveLock(7),
                 MenuAction::DeleteCollection(7)
             ]
         );
         assert!(
             ArchiveApp::collection_menu(&Page::Album("key".into()), LockState::None).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_collection_renames_from_its_menu_and_refuses_a_taken_or_locked_name() {
+        let (_temp, mut app, _ids) = app_with_photos(1);
+        let trips = app.library.create_collection("Trips").unwrap();
+        let work = app.library.create_collection("Work").unwrap();
+
+        app.ask_rename(trips);
+        assert!(matches!(&app.modal, Some(Modal::Rename { name, .. }) if name == "Trips"));
+        app.text_input(" 2025");
+        app.confirm_modal();
+        assert!(app.modal.is_none());
+        assert!(
+            app.library
+                .collections()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == trips && c.name == "Trips 2025")
+        );
+
+        // A name another collection has, in any case, is refused and the dialog stays.
+        app.modal = Some(Modal::Rename {
+            collection: work,
+            name: "trips 2025".into(),
+            error: None,
+        });
+        app.confirm_modal();
+        assert!(
+            matches!(&app.modal, Some(Modal::Rename { error: Some(e), .. }) if e.contains("already exists"))
+        );
+
+        // A locked collection is not renamed, whatever the dialog says.
+        app.library
+            .create_lock(trips, "correct horse battery")
+            .unwrap();
+        app.modal = Some(Modal::Rename {
+            collection: trips,
+            name: "Holiday".into(),
+            error: None,
+        });
+        app.confirm_modal();
+        assert!(
+            matches!(&app.modal, Some(Modal::Rename { error: Some(e), .. }) if e.contains("unlock"))
+        );
+        assert!(
+            app.library
+                .collections()
+                .unwrap()
+                .iter()
+                .any(|c| c.id == trips && c.name == "Trips 2025")
+        );
+    }
+
+    #[test]
+    fn a_sealed_library_shows_only_its_password_screen_until_the_password_opens_it() {
+        use crate::worker::{AppLockDone, AppLockKind, AppLockReply};
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("library");
+        archive_core::Library::open(&root)
+            .unwrap()
+            .set_password("correct horse battery", &mut |_| {})
+            .unwrap();
+        let mut app = ArchiveApp::headless(root, Settings::default()).unwrap();
+        assert!(app.gate.is_some(), "a sealed library starts shut");
+
+        // Typing goes to the password, and nothing else takes it in.
+        app.text_input("guess");
+        app.import(vec![temp.path().join("missing.jpg")]);
+        assert!(
+            app.modal.is_none(),
+            "an import is refused while the library is shut"
+        );
+        assert_eq!(app.gate.as_ref().unwrap().typed, "guess");
+
+        app.on_app_lock_done(AppLockDone {
+            kind: AppLockKind::Unlock,
+            result: Ok(AppLockReply::Wrong),
+        });
+        let gate = app.gate.as_ref().unwrap();
+        assert!(
+            gate.typed.is_empty(),
+            "a wrong attempt clears what was typed"
+        );
+        assert_eq!(gate.error.as_deref(), Some("That is not the password."));
+
+        // The job unlocks the library before it reports success.
+        assert!(app.library.unlock_library("correct horse battery").unwrap());
+        app.on_app_lock_done(AppLockDone {
+            kind: AppLockKind::Unlock,
+            result: Ok(AppLockReply::Done),
+        });
+        assert!(app.gate.is_none(), "the right password opens the app");
+    }
+
+    #[test]
+    fn setting_and_removing_a_password_run_in_the_background_and_report_back() {
+        use crate::worker::{AppEvent, AppLockKind};
+        use archive_core::Encryption;
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut app =
+            ArchiveApp::headless(temp.path().join("library"), Settings::default()).unwrap();
+        assert_eq!(app.library.encryption(), Encryption::Plain);
+
+        // Waits for the job's own event, passing the rest on as the app would.
+        let mut finish = |app: &mut ArchiveApp| loop {
+            match app.events_rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(AppEvent::AppLock(done)) => {
+                    app.on_app_lock_done(done);
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => panic!("the password job never reported back: {error}"),
+            }
+        };
+
+        app.start_password_job(
+            AppLockKind::Set,
+            String::new(),
+            Some("correct horse battery".into()),
+        );
+        finish(&mut app);
+        assert_eq!(
+            app.library.encryption(),
+            Encryption::Open,
+            "the library is sealed"
+        );
+        assert!(app.modal.is_none());
+
+        app.start_password_job(AppLockKind::Remove, "not the password".into(), None);
+        finish(&mut app);
+        assert_eq!(
+            app.library.encryption(),
+            Encryption::Open,
+            "a wrong password removes nothing"
+        );
+
+        app.start_password_job(AppLockKind::Remove, "correct horse battery".into(), None);
+        finish(&mut app);
+        assert_eq!(
+            app.library.encryption(),
+            Encryption::Plain,
+            "the library is plain again"
         );
     }
 
@@ -10981,5 +12822,100 @@ mod tests {
             corner.x < 1430.0 && corner.y < 890.0,
             "the card turns back toward the pointer: {corner:?}"
         );
+    }
+
+    #[test]
+    fn search_filters_immediately_by_tag_and_prioritizes_tags_over_semantic() {
+        let (_temp, mut app, ids) = app_with_photos(3);
+        app.library.add_item_tag(&ids[2], "Food").unwrap();
+
+        // Typing a non-matching query immediately filters out non-matching items.
+        app.search = "UnmatchedTag".into();
+        app.filter_display();
+        assert!(app.display.is_empty());
+
+        // Case-sensitive tag match shows immediately.
+        app.search = "Food".into();
+        app.filter_display();
+        assert_eq!(
+            app.display.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            vec![ids[2].clone()]
+        );
+
+        // Case-sensitive mismatch does not match "Food".
+        app.search = "food".into();
+        app.filter_display();
+        assert!(app.display.is_empty());
+
+        // When semantic results are merged, tag matches come first without duplicates.
+        let merged = app.merge_tag_search("Food", &[ids[0].clone(), ids[2].clone(), ids[1].clone()]);
+        assert_eq!(merged, vec![ids[2].clone(), ids[0].clone(), ids[1].clone()]);
+    }
+
+    #[test]
+    fn collection_tag_management_is_independent_of_children_and_searchable() {
+        let (_temp, mut app, ids) = app_with_photos(2);
+        let meals = app.library.create_collection("Meals").unwrap();
+        let snacks = app.library.create_collection("Snacks").unwrap();
+        app.library.add_to_collection(meals, &ids).unwrap();
+        app.library.add_to_collection(snacks, &[ids[0].clone()]).unwrap();
+        app.library.add_item_tag(&ids[0], "Breakfast").unwrap();
+        app.reload();
+
+        // Child item tags never show up as collection tags.
+        app.ask_tag_collection(meals);
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::TagCollection { tags, .. }) if tags.is_empty()
+        ));
+
+        // Typing "Br" suggests existing tag "Breakfast" since Meals doesn't have it yet; Tab accepts it.
+        app.text_input("Br");
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::TagCollection { suggestion: Some(s), .. }) if s == "Breakfast"
+        ));
+        app.key(dream::ui::widgets::Key::Tab, true);
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::TagCollection { input, .. }) if input == "Breakfast"
+        ));
+
+        // Submitting adds "Breakfast" to Meals itself, without touching child item ids[1].
+        app.confirm_modal();
+        assert!(!app.library.item_tags(&ids[1]).unwrap().contains(&"Breakfast".to_string()));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::TagCollection { input, tags, .. }) if input.is_empty() && tags == &vec!["Breakfast".to_string()]
+        ));
+
+        // Autocomplete for Meals now excludes "Breakfast" since Meals already has it.
+        app.text_input("Br");
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::TagCollection { suggestion: None, .. })
+        ));
+        app.modal = None;
+
+        // Searching on the Collections page finds Meals by its own tag, not Snacks (which only has a child with that tag).
+        app.set_page(Page::Collections);
+        app.search = "Breakfast".into();
+        app.filter_display();
+        assert_eq!(
+            app.cover_tiles
+                .iter()
+                .map(|t| t.page.clone())
+                .collect::<Vec<_>>(),
+            vec![Page::Collection(meals)]
+        );
+
+        // Removing the tag from Meals does not remove it from child item ids[0].
+        app.ask_tag_collection(meals);
+        app.remove_tag_from_collection_modal(meals, "Breakfast");
+        assert!(app.library.item_tags(&ids[0]).unwrap().contains(&"Breakfast".to_string()));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::TagCollection { tags, .. }) if tags.is_empty()
+        ));
     }
 }

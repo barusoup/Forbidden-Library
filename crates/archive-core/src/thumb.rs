@@ -1,7 +1,9 @@
+use crate::decode;
 use crate::error::{Error, Result};
 use crate::ffmpeg::Tools;
 use crate::model::Kind;
 use crate::paths::Paths;
+use crate::sealed;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, RgbImage, RgbaImage};
 use std::path::Path;
@@ -39,8 +41,9 @@ pub struct ThumbOutcome {
     pub avg_color: u32,
 }
 
-/// Render a preview next to the catalogue. `source` is the stored file.
-/// `orientation` is the EXIF orientation of the original.
+/// Render a preview next to the catalogue. `source_rel` is the stored file,
+/// relative to the library root. `orientation` is the EXIF orientation of the
+/// original.
 ///
 /// The image is decoded once. It is scaled while still un-rotated (a full
 /// resolution rotation of a 24 MP photo would copy a hundred megabytes for
@@ -49,27 +52,28 @@ pub struct ThumbOutcome {
 pub fn generate(
     paths: &Paths,
     item_id: &str,
-    source: &Path,
+    source_rel: &str,
     kind: Kind,
     orientation: i32,
     duration_ms: Option<i64>,
     tools: &Tools,
 ) -> Result<ThumbOutcome> {
-    let dest = paths.thumb_path(item_id);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let dest = Paths::thumb_rel(item_id);
     match kind {
         Kind::Video => {
             let at = duration_ms.unwrap_or(0).clamp(0, 2000) / 10;
-            let viewer = paths.viewer_jpeg_path(item_id);
-            if let Some(parent) = viewer.parent() {
-                std::fs::create_dir_all(parent)?;
+            let source = sealed::plain_path(paths, source_rel)?;
+            let viewer_rel = Paths::viewer_jpeg_rel(item_id);
+            let poster = sealed::temp_file(paths, "jpg");
+            let placed = poster_with_fallback(tools, source.path(), &poster, VIEWER_SIDE, at)
+                .and_then(|()| sealed::seal_into(paths, &poster, &viewer_rel));
+            if let Err(error) = placed {
+                let _ = std::fs::remove_file(&poster);
+                return Err(error);
             }
-            poster_with_fallback(tools, source, &viewer, VIEWER_SIDE, at)?;
-            let preview = crate::decode::open(&viewer)?;
+            let preview = decode_rel(paths, &viewer_rel)?;
             let flat = flatten(fit(preview, 1, THUMB_SIDE, FilterType::Lanczos3));
-            write_jpeg(&flat, &dest, THUMB_QUALITY)?;
+            write_jpeg(paths, &dest, &flat, THUMB_QUALITY)?;
             Ok(ThumbOutcome {
                 avg_color: average_color(&flat),
             })
@@ -79,17 +83,19 @@ pub fn generate(
             // decoded like any photo. Seeking ffmpeg to a frame would skip an
             // attached picture in Ogg, which has no timestamp to seek to. A file
             // without a cover fails here, and the caller keeps it without one.
-            let cover = paths
-                .tmp()
-                .join(format!("cover_{}.bin", crate::time::stamp()));
-            let extracted = crate::ffmpeg::extract_cover(tools, source, &cover);
-            let decoded = extracted.and_then(|_| decode_with_image(&cover));
+            let source = sealed::plain_path(paths, source_rel)?;
+            let cover = sealed::temp_file(paths, "bin");
+            let extracted = crate::ffmpeg::extract_cover(tools, source.path(), &cover);
+            let decoded = extracted.and_then(|_| {
+                let bytes = std::fs::read(&cover)?;
+                decode::open_bytes(&bytes, source_rel)
+            });
             let _ = std::fs::remove_file(&cover);
             let image = decoded?;
             let viewer = fit(image, 1, VIEWER_SIDE, FilterType::Lanczos3);
             write_viewer(paths, item_id, &viewer)?;
             let flat = flatten(fit(viewer, 1, THUMB_SIDE, FilterType::Lanczos3));
-            write_jpeg(&flat, &dest, THUMB_QUALITY)?;
+            write_jpeg(paths, &dest, &flat, THUMB_QUALITY)?;
             Ok(ThumbOutcome {
                 avg_color: average_color(&flat),
             })
@@ -97,8 +103,10 @@ pub fn generate(
         _ => {
             // ffmpeg frames are already rotated, so they are used as they
             // come. Everything the Rust decoders read is turned here.
-            let (image, orientation) = match decode_with_image(source) {
-                Ok(image) => (image, orientation_after_decode(source, orientation)),
+            let (image, orientation) = match read_source(paths, source_rel)
+                .and_then(|bytes| decode_source(&bytes, source_rel, orientation))
+            {
+                Ok(decoded) => decoded,
                 Err(image_error) => {
                     // HEIC, AVIF, RAW and friends. ffmpeg's lossless still is
                     // decoded like any other image, so the proxy below is made
@@ -108,7 +116,8 @@ pub fn generate(
                             "{image_error}; ffmpeg is required to preview this format"
                         )));
                     }
-                    let still = ffmpeg_still(paths, tools, source, VIEWER_SIDE).map_err(
+                    let source = sealed::plain_path(paths, source_rel)?;
+                    let still = ffmpeg_still(paths, tools, source.path(), VIEWER_SIDE).map_err(
                         |ffmpeg_error| Error::Msg(format!("{image_error}; {ffmpeg_error}")),
                     )?;
                     (still, 1)
@@ -118,10 +127,45 @@ pub fn generate(
             write_viewer(paths, item_id, &viewer)?;
             let flat = flatten(fit(viewer, 1, THUMB_SIDE, FilterType::Lanczos3));
             let avg_color = average_color(&flat);
-            write_jpeg(&flat, &dest, THUMB_QUALITY)?;
+            write_jpeg(paths, &dest, &flat, THUMB_QUALITY)?;
             Ok(ThumbOutcome { avg_color })
         }
     }
+}
+
+/// The stored bytes of `rel`, for decoding in memory.
+fn read_source(paths: &Paths, rel: &str) -> Result<Vec<u8>> {
+    sealed::read_bytes(paths, rel)
+}
+
+/// Decode a stored original from its bytes, and work out the orientation still
+/// to apply. A JPEG XL whose codestream carries a rotation comes out of the
+/// decoder already turned, so the EXIF orientation must not be applied again.
+fn decode_source(bytes: &[u8], label: &str, orientation: i32) -> Result<(DynamicImage, i32)> {
+    let image = decode::open_bytes(bytes, label)?;
+    let orientation = if crate::jxl::oriented_by_decoder_bytes(bytes) {
+        1
+    } else {
+        orientation
+    };
+    Ok((image, orientation))
+}
+
+/// The orientation still to apply after decoding the file at `source`. See
+/// [`decode_source`].
+#[cfg(test)]
+pub(crate) fn orientation_after_decode(source: &Path, orientation: i32) -> i32 {
+    if crate::jxl::oriented_by_decoder(source) {
+        1
+    } else {
+        orientation
+    }
+}
+
+/// Decode a library file by its catalogue-relative path.
+fn decode_rel(paths: &Paths, rel: &str) -> Result<DynamicImage> {
+    let bytes = sealed::read_bytes(paths, rel)?;
+    decode::open_bytes(&bytes, rel)
 }
 
 fn decode_with_image(path: &Path) -> Result<DynamicImage> {
@@ -131,16 +175,14 @@ fn decode_with_image(path: &Path) -> Result<DynamicImage> {
 /// Decode a still the Rust decoders cannot read, through ffmpeg. The PNG
 /// ffmpeg writes is staged in the library's `tmp/` and removed once decoded.
 /// An opaque picture comes back as RGB, so it is stored as a JPEG proxy
-/// rather than a PNG one.
+/// rather than a PNG one. `source` is a plain file.
 fn ffmpeg_still(
     paths: &Paths,
     tools: &Tools,
     source: &Path,
     max_side: u32,
 ) -> Result<DynamicImage> {
-    let temp = paths
-        .tmp()
-        .join(format!("still_{}.png", crate::time::stamp()));
+    let temp = sealed::temp_file(paths, "png");
     let decoded = crate::ffmpeg::image_poster(tools, source, &temp, max_side)
         .and_then(|_| decode_with_image(&temp));
     let _ = std::fs::remove_file(&temp);
@@ -160,46 +202,35 @@ fn without_opaque_alpha(image: DynamicImage) -> DynamicImage {
     }
 }
 
-/// The orientation still to apply after decoding `source`. A JPEG XL whose
-/// codestream carries a rotation comes out of the decoder already turned, so
-/// the EXIF orientation of the original must not be applied on top of it.
-pub(crate) fn orientation_after_decode(source: &Path, orientation: i32) -> i32 {
-    if crate::jxl::oriented_by_decoder(source) {
-        1
-    } else {
-        orientation
-    }
-}
-
 /// Decode the persistent viewer proxy for an item, creating it from the
 /// original once when the archive predates this cache.
 #[allow(clippy::too_many_arguments)]
 pub fn preview_rgba(
     paths: &Paths,
     item_id: &str,
-    source: &Path,
+    source_rel: &str,
     kind: Kind,
     orientation: i32,
     duration_ms: Option<i64>,
     max_side: u32,
     tools: Option<&Tools>,
 ) -> Result<(u32, u32, Vec<u8>)> {
-    let jpeg = paths.viewer_jpeg_path(item_id);
-    let png = paths.viewer_png_path(item_id);
-    let cached_path = if png.is_file() {
-        Some(png.as_path())
-    } else if jpeg.is_file() {
-        Some(jpeg.as_path())
+    let jpeg = Paths::viewer_jpeg_rel(item_id);
+    let png = Paths::viewer_png_rel(item_id);
+    let cached = if paths.abs(&png).is_file() {
+        Some(png)
+    } else if paths.abs(&jpeg).is_file() {
+        Some(jpeg)
     } else {
         None
     };
 
-    let image = if let Some(path) = cached_path {
-        decode_with_image(path)?
+    let image = if let Some(rel) = cached {
+        decode_rel(paths, &rel)?
     } else {
         let fitted = preview_rgba_uncached(
             paths,
-            source,
+            source_rel,
             kind,
             orientation,
             duration_ms,
@@ -225,7 +256,7 @@ pub fn preview_rgba(
 /// large downscale, and Lanczos3 there is too slow for a viewer waiting on it.
 pub fn full_rgba(
     paths: &Paths,
-    source: &Path,
+    source_rel: &str,
     kind: Kind,
     orientation: i32,
     duration_ms: Option<i64>,
@@ -239,7 +270,7 @@ pub fn full_rgba(
     };
     let image = preview_rgba_uncached(
         paths,
-        source,
+        source_rel,
         kind,
         orientation,
         duration_ms,
@@ -255,7 +286,7 @@ pub fn full_rgba(
 #[allow(clippy::too_many_arguments)]
 fn preview_rgba_uncached(
     paths: &Paths,
-    source: &Path,
+    source_rel: &str,
     kind: Kind,
     orientation: i32,
     duration_ms: Option<i64>,
@@ -263,37 +294,36 @@ fn preview_rgba_uncached(
     tools: Option<&Tools>,
     filter: FilterType,
 ) -> Result<DynamicImage> {
-    // ffmpeg applies the container/EXIF rotation itself, so its frames must
-    // not be turned a second time.
-    let decoded = if kind != Kind::Video {
-        decode_with_image(source)
-    } else {
-        Err(Error::Msg("video requires ffmpeg".into()))
-    };
-    match decoded {
-        Ok(image) => Ok(fit(
-            image,
-            orientation_after_decode(source, orientation),
-            max_side,
-            filter,
-        )),
+    if kind == Kind::Video {
+        // ffmpeg applies the container's rotation itself, so its frames must
+        // not be turned a second time.
+        let tools = tools.ok_or_else(|| Error::Msg("video requires ffmpeg".into()))?;
+        if !tools.has_ffmpeg() {
+            return Err(Error::Msg("ffmpeg is required to preview this file".into()));
+        }
+        let source = sealed::plain_path(paths, source_rel)?;
+        let temp = sealed::temp_file(paths, "jpg");
+        let at = duration_ms.unwrap_or(0).clamp(0, 2000) / 10;
+        let decoded =
+            poster_with_fallback(tools, source.path(), &temp, max_side, at).and_then(|()| {
+                let bytes = std::fs::read(&temp)?;
+                decode::open_bytes(&bytes, source_rel)
+            });
+        let _ = std::fs::remove_file(&temp);
+        return decoded;
+    }
+    match read_source(paths, source_rel)
+        .and_then(|bytes| decode_source(&bytes, source_rel, orientation))
+    {
+        Ok((image, orientation)) => Ok(fit(image, orientation, max_side, filter)),
         Err(_) => {
             let tools = tools
                 .ok_or_else(|| Error::Msg("ffmpeg is required to preview this file".into()))?;
             if !tools.has_ffmpeg() {
                 return Err(Error::Msg("ffmpeg is required to preview this file".into()));
             }
-            if kind != Kind::Video {
-                return ffmpeg_still(paths, tools, source, max_side);
-            }
-            let temp = paths
-                .tmp()
-                .join(format!("preview_{}.jpg", crate::time::stamp()));
-            let at = duration_ms.unwrap_or(0).clamp(0, 2000) / 10;
-            let decoded = poster_with_fallback(tools, source, &temp, max_side, at)
-                .and_then(|_| decode_with_image(&temp));
-            let _ = std::fs::remove_file(&temp);
-            decoded
+            let source = sealed::plain_path(paths, source_rel)?;
+            ffmpeg_still(paths, tools, source.path(), max_side)
         }
     }
 }
@@ -315,17 +345,20 @@ fn poster_with_fallback(
 }
 
 fn write_viewer(paths: &Paths, item_id: &str, image: &DynamicImage) -> Result<()> {
-    let jpeg = paths.viewer_jpeg_path(item_id);
-    let png = paths.viewer_png_path(item_id);
-    if let Some(parent) = jpeg.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let jpeg = Paths::viewer_jpeg_rel(item_id);
+    let png = Paths::viewer_png_rel(item_id);
     if image.color().has_alpha() {
-        image.save_with_format(&png, image::ImageFormat::Png)?;
-        let _ = std::fs::remove_file(jpeg);
+        let mut bytes = Vec::new();
+        image.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )?;
+        sealed::write_bytes(paths, &png, &bytes)?;
+        let _ = std::fs::remove_file(paths.abs(&jpeg));
     } else {
-        write_jpeg(&image.to_rgb8(), &jpeg, VIEWER_QUALITY)?;
-        let _ = std::fs::remove_file(png);
+        let bytes = encode_jpeg(&image.to_rgb8(), VIEWER_QUALITY)?;
+        sealed::write_bytes(paths, &jpeg, &bytes)?;
+        let _ = std::fs::remove_file(paths.abs(&png));
     }
     Ok(())
 }
@@ -427,11 +460,15 @@ fn blend_over_matte(image: &RgbaImage) -> RgbImage {
     RgbImage::from_raw(width, height, out).unwrap_or_else(|| RgbImage::new(width, height))
 }
 
-fn write_jpeg(image: &RgbImage, dest: &Path, quality: u8) -> Result<()> {
-    let file = std::fs::File::create(dest)
-        .map_err(|e| Error::Msg(format!("create preview {}: {e}", dest.display())))?;
-    let writer = std::io::BufWriter::new(file);
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, quality);
+/// Store `image` as a JPEG at the catalogue-relative path `rel`.
+fn write_jpeg(paths: &Paths, rel: &str, image: &RgbImage, quality: u8) -> Result<()> {
+    let bytes = encode_jpeg(image, quality)?;
+    sealed::write_bytes(paths, rel, &bytes)
+}
+
+fn encode_jpeg(image: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality);
     let (width, height) = image.dimensions();
     encoder
         .encode(
@@ -440,7 +477,8 @@ fn write_jpeg(image: &RgbImage, dest: &Path, quality: u8) -> Result<()> {
             height,
             image::ExtendedColorType::Rgb8,
         )
-        .map_err(|e| Error::Msg(format!("encode preview: {e}")))
+        .map_err(|e| Error::Msg(format!("encode preview: {e}")))?;
+    Ok(bytes)
 }
 
 /// Average colour of a preview, sampled on a bounded grid. The tile only

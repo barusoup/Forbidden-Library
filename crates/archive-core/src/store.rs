@@ -1,7 +1,7 @@
 use crate::db;
 use crate::error::{Error, Result};
 use crate::paths::Paths;
-use crate::time;
+use crate::sealed;
 use rusqlite::Connection;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -41,18 +41,15 @@ impl Staged {
     }
 }
 
-/// Copy `source` into `tmp_dir`, hashing as it goes. The staging file is
-/// fsynced before this returns: the bytes are durable before any rename.
-/// `progress` receives the number of bytes copied so far.
-pub fn stage_copy(source: &Path, tmp_dir: &Path, mut progress: impl FnMut(u64)) -> Result<Staged> {
+/// Copy `source` into `tmp/`, hashing as it goes. The staging file is sealed
+/// on the way when the library is sealed, and is fsynced before this returns,
+/// so its bytes are durable before any rename. The hash is always of the
+/// plaintext. `progress` receives the number of bytes copied so far.
+pub fn stage_copy(paths: &Paths, source: &Path, mut progress: impl FnMut(u64)) -> Result<Staged> {
     let mut input = open_sequential(source)
         .map_err(|e| Error::Msg(format!("open {}: {e}", source.display())))?;
-    let tmp = unique_tmp(tmp_dir);
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(|e| Error::Msg(format!("create {}: {e}", tmp.display())))?;
+    let tmp = sealed::temp_file(paths, "stage");
+    let mut output = paths.key.with(|key| sealed::Sink::create(&tmp, key))?;
     let mut hasher = blake3::Hasher::new();
     let mut total = 0u64;
     let result = with_buffer(|buffer| -> Result<()> {
@@ -73,8 +70,10 @@ pub fn stage_copy(source: &Path, tmp_dir: &Path, mut progress: impl FnMut(u64)) 
         let _ = std::fs::remove_file(&tmp);
         return Err(error);
     }
-    output.flush()?;
-    output.sync_all()?;
+    if let Err(error) = output.finish() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     Ok(Staged {
         hash: hasher.finalize().to_hex().to_string(),
         tmp,
@@ -82,22 +81,31 @@ pub fn stage_copy(source: &Path, tmp_dir: &Path, mut progress: impl FnMut(u64)) 
     })
 }
 
-/// Swap a staged copy for a replacement encoded beside it. The replacement is
-/// hashed and fsynced before anything else happens, so a failure leaves the
-/// original staged copy where it was. Only then is the original removed.
-pub fn replace_staged(original: &Staged, replacement: &Path) -> Result<Staged> {
+/// Swap a staged copy for a replacement encoded beside it, at the plain path
+/// `replacement`. The replacement is hashed and fsynced, and sealed into tmp
+/// when the library is sealed, before anything else happens; a failure leaves
+/// the original staged copy where it was. Only then is the original removed.
+pub fn replace_staged(paths: &Paths, original: &Staged, replacement: &Path) -> Result<Staged> {
     let hash = hash_file(replacement)?;
     let bytes = std::fs::metadata(replacement)?.len();
-    OpenOptions::new()
-        .write(true)
-        .open(replacement)?
-        .sync_all()?;
+    let tmp = if paths.key.is_set() {
+        let ext = replacement
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("bin")
+            .to_owned();
+        let sealed_tmp = sealed::seal_to_temp(paths, replacement, &ext)?;
+        let _ = std::fs::remove_file(replacement);
+        sealed_tmp
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .open(replacement)?
+            .sync_all()?;
+        replacement.to_path_buf()
+    };
     original.discard();
-    Ok(Staged {
-        hash,
-        tmp: replacement.to_path_buf(),
-        bytes,
-    })
+    Ok(Staged { hash, tmp, bytes })
 }
 
 /// Move a staged file into the store. Returns the catalogue-relative path.
@@ -156,12 +164,6 @@ pub fn remove_unreferenced(paths: &Paths, conn: &Connection, rel: &str) {
     if matches!(db::path_references(conn, rel), Ok(0)) {
         let _ = std::fs::remove_file(paths.abs(rel));
     }
-}
-
-/// Unique staging name. The timestamp makes leftovers identifiable; the
-/// counter and pid keep concurrent workers apart.
-pub fn unique_tmp(tmp_dir: &Path) -> PathBuf {
-    tmp_dir.join(format!("{}.stage", time::stamp()))
 }
 
 /// Open a file for a straight read-through. Windows caches and read-aheads
