@@ -8,6 +8,31 @@
 # Needs Inno Setup 6 (https://jrsoftware.org/isinfo.php) for ISCC.exe.
 
 $ErrorActionPreference = "Stop"
+# The libjxl release zips are zstd-compressed, which .NET's Expand-Archive
+# cannot read ("unsupported compression method"). 7-Zip and the tar.exe that
+# ships with Windows both can; Expand-Archive stays as a last resort for
+# deflate archives on a machine without either.
+function Expand-ReleaseArchive {
+    param([string]$Path, [string]$Destination)
+    $sevenZip = @(
+        (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source,
+        "$env:ProgramFiles\7-Zip\7z.exe",
+        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($sevenZip) {
+        & $sevenZip x -y "-o$Destination" $Path | Out-Null
+        if ($LASTEXITCODE -eq 0) { return }
+        throw "7-Zip could not extract $Path"
+    }
+    if (Get-Command tar.exe -ErrorAction SilentlyContinue) {
+        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+        & tar.exe -xf $Path -C $Destination
+        if ($LASTEXITCODE -eq 0) { return }
+        throw "tar could not extract $Path"
+    }
+    Expand-Archive -Path $Path -DestinationPath $Destination -Force
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
@@ -27,7 +52,7 @@ if (-not (Test-Path (Join-Path $ffmpegDir "ffmpeg.exe")) -or
     Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
     $extract = Join-Path $env:TEMP "forbiddenlibrary-ffmpeg-extract"
     if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
-    Expand-Archive -Path $zip -DestinationPath $extract -Force
+    Expand-ReleaseArchive -Path $zip -Destination $extract
     $bin = Get-ChildItem -Path $extract -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
     if (-not $bin) { throw "The FFmpeg archive did not contain ffmpeg.exe" }
     $source = Split-Path -Parent $bin.FullName
@@ -54,7 +79,7 @@ if (-not (Test-Path (Join-Path $jxlDir "cjxl.exe")) -or
     }
     $extract = Join-Path $env:TEMP "forbiddenlibrary-libjxl-extract"
     if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
-    Expand-Archive -Path $zip -DestinationPath $extract -Force
+    Expand-ReleaseArchive -Path $zip -Destination $extract
     # The archive nests its tools under a platform folder (x64-windows-static\bin).
     $bin = Get-ChildItem -Path $extract -Recurse -Filter "cjxl.exe" | Select-Object -First 1
     if (-not $bin) { throw "The libjxl archive did not contain cjxl.exe" }
