@@ -1,6 +1,6 @@
 use archive_core::{
     ImportEvent, ImportOptions, Library, OptState, OptimizeConfig, ThumbState, TimelineFilter,
-    VerifyOptions, human_bytes, import_paths,
+    Tools, VerifyOptions, human_bytes, import_paths,
 };
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
@@ -50,6 +50,25 @@ fn write_jpeg(path: &Path, image: &RgbImage) {
     encoder
         .encode_image(&image::DynamicImage::ImageRgb8(image.clone()))
         .unwrap();
+}
+
+/// The ffmpeg this process can use, preferring a downloaded bundled build so a
+/// developer machine tests the binaries the installer ships. `None` when the
+/// test needs a tool this machine does not have.
+fn ffmpeg() -> Option<std::path::PathBuf> {
+    static POINT: std::sync::Once = std::sync::Once::new();
+    POINT.call_once(|| {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/ffmpeg");
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        if dir.join(format!("ffmpeg{suffix}")).is_file() {
+            // SAFETY: set before this process starts any engine work, and
+            // every test that needs the tool calls this first.
+            unsafe {
+                std::env::set_var("FORBIDDEN_LIBRARY_FFMPEG_DIR", &dir);
+            }
+        }
+    });
+    Tools::discover().ffmpeg
 }
 
 fn import_all(library: &Library, paths: &[std::path::PathBuf]) -> archive_core::ImportReport {
@@ -673,26 +692,21 @@ fn a_missing_preview_is_rebuilt_when_it_is_read() {
 /// preview would be missing rather than merely slow.
 #[test]
 fn a_video_is_probed_and_previewed_with_bounded_ffmpeg() {
-    let tools = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/ffmpeg");
-    if !tools.join("ffmpeg.exe").is_file() {
-        eprintln!("skipping: assets/ffmpeg is not present");
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("skipping: ffmpeg was not found");
         return;
-    }
-    // SAFETY: set before this test starts any worker that reads it.
-    unsafe {
-        std::env::set_var("FORBIDDEN_LIBRARY_FFMPEG_DIR", &tools);
-    }
+    };
     let temp = TempDir::new().unwrap();
     let frame = temp.path().join("frame.png");
     write_png(&frame, &photo(320, 240));
     let video = temp.path().join("clip.mp4");
-    let status = std::process::Command::new(tools.join("ffmpeg.exe"))
+    let status = std::process::Command::new(&ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-loop", "1", "-i"])
         .arg(&frame)
         .args(["-t", "1", "-pix_fmt", "yuv420p", "-y"])
         .arg(&video)
         .status()
-        .expect("the bundled ffmpeg must start");
+        .expect("ffmpeg must start");
     assert!(status.success(), "could not build the video fixture");
 
     let library = Library::open(temp.path().join("library")).unwrap();

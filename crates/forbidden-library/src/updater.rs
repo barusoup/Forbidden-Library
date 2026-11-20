@@ -6,17 +6,27 @@
 //! the new executable is started in place of this one. When the machine is
 //! offline, or anything at all goes wrong, the current version simply starts.
 //!
-//! A release publishes `update.json` next to its installer:
+//! Each platform has its own manifest next to the release assets:
 //!
 //! ```json
 //! { "version": "0.1.1", "url": "https://github.com/.../update.zip",
 //!   "sha256": "<hex>", "size": 12345678 }
 //! ```
 //!
+//! Windows publishes `update.json` and `update.zip`; the Inno Setup installer
+//! leaves `unins000.exe` beside the executable, and only a copy with that
+//! file updates itself. Linux publishes `update-linux.json` and
+//! `update-linux.zip`; `installer/install.sh` writes a `.installed` marker in
+//! the install directory instead. The marker matters there because a Linux
+//! build can be unpacked and run from anywhere: without it, a loose copy next
+//! to a `library/` folder would rewrite itself and its neighbours.
+//!
 //! The archive holds the files that change between releases. The large,
 //! rarely changing parts (FFmpeg, the search model) arrive with the installer.
 //! Files in use cannot be deleted on Windows but can be renamed, so replaced
-//! files are moved into `.update-old` and removed on a later launch.
+//! files are moved into `.update-old` and removed on a later launch. Linux can
+//! replace a running executable outright, but the same staged swap is used for
+//! both platforms so there is one code path and one rollback story.
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -25,8 +35,29 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+const PLATFORM: &str = "Windows";
+#[cfg(not(windows))]
+const PLATFORM: &str = "Linux";
+
+/// Manifest and archive a release publishes for this platform.
+#[cfg(windows)]
 const MANIFEST_URL: &str =
     "https://github.com/barusoup/Forbidden-Library/releases/latest/download/update.json";
+#[cfg(not(windows))]
+const MANIFEST_URL: &str =
+    "https://github.com/barusoup/Forbidden-Library/releases/latest/download/update-linux.json";
+#[cfg(windows)]
+const ARCHIVE_FILE: &str = "update.zip";
+#[cfg(not(windows))]
+const ARCHIVE_FILE: &str = "update-linux.zip";
+/// File the installer leaves in the install directory; its presence is what
+/// makes a copy of the app eligible to update itself.
+#[cfg(windows)]
+const INSTALL_MARKER: &str = "unins000.exe";
+#[cfg(not(windows))]
+const INSTALL_MARKER: &str = ".installed";
+
 const DOWNLOAD_PREFIX: &str = "https://github.com/barusoup/Forbidden-Library/releases/download/";
 const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -56,18 +87,26 @@ pub fn run_before_launch(args: &[String]) -> bool {
     let Some(install) = exe.parent().map(Path::to_path_buf) else {
         return false;
     };
-    // Only a copy placed by the installer updates itself.
-    if !install.join("unins000.exe").is_file() {
+    // Only a copy placed by the platform installer updates itself: the
+    // Windows installer leaves `unins000.exe`, and install.sh leaves
+    // `.installed` in the install directory.
+    if !installed(&install) {
         return false;
     }
     let _ = fs::remove_dir_all(install.join(OLD_DIR));
     match update(&exe, &install, args) {
         Ok(started) => started,
         Err(error) => {
-            log(&format!("update skipped: {error}"));
+            log(&format!("{PLATFORM} update skipped: {error}"));
             false
         }
     }
+}
+
+/// Whether this copy was put in place by the installer. A loose unpacked
+/// build must never rewrite itself.
+fn installed(install: &Path) -> bool {
+    install.join(INSTALL_MARKER).is_file()
 }
 
 fn update(exe: &Path, install: &Path, args: &[String]) -> Result<bool, String> {
@@ -86,10 +125,7 @@ fn update(exe: &Path, install: &Path, args: &[String]) -> Result<bool, String> {
     if !is_newer(&manifest.version, env!("CARGO_PKG_VERSION")) {
         return Ok(false);
     }
-    if !manifest.url.starts_with(DOWNLOAD_PREFIX)
-        || manifest.size == 0
-        || manifest.size > MAX_ARCHIVE
-    {
+    if !archive_url_is_trusted(&manifest.url) || manifest.size == 0 || manifest.size > MAX_ARCHIVE {
         return Err("manifest points somewhere unexpected".into());
     }
     if recently_tried(&manifest.version) {
@@ -111,12 +147,37 @@ fn update(exe: &Path, install: &Path, args: &[String]) -> Result<bool, String> {
     let _ = fs::remove_file(&archive);
     result?;
 
+    // Zip entries do not always carry the executable bit. Make sure the
+    // replacement can actually be started before handing over to it.
+    ensure_executable(exe);
     std::process::Command::new(exe)
         .args(args)
         .spawn()
         .map_err(|e| format!("restart: {e}"))?;
     Ok(true)
 }
+
+/// A release archive must come from this project's downloads and carry this
+/// platform's archive name; anything else is a redirect or a bad manifest.
+fn archive_url_is_trusted(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.starts_with(DOWNLOAD_PREFIX) && path.rsplit('/').next() == Some(ARCHIVE_FILE)
+}
+
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        if permissions.mode() & 0o111 == 0 {
+            permissions.set_mode(0o755);
+            let _ = fs::set_permissions(path, permissions);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}
 
 fn download(agent: &ureq::Agent, manifest: &Manifest, dest: &Path) -> Result<(), String> {
     let response = agent
@@ -172,6 +233,13 @@ fn extract(archive: &Path, staging: &Path) -> Result<(), String> {
         }
         let mut out = fs::File::create(&target).map_err(|e| e.to_string())?;
         std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
+        // Unix archives record permissions; keep helper binaries executable.
+        // Files without a recorded mode keep the umask default.
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o777));
+        }
     }
     Ok(())
 }
@@ -300,6 +368,43 @@ mod tests {
         assert!(!is_newer("0.0.9", "0.1.0"));
         assert!(!is_newer("junk", "0.1.0"));
         assert!(!is_newer("1.0", "0.1.0"));
+    }
+
+    #[test]
+    fn only_installer_placed_copies_update_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!installed(dir.path()));
+        fs::write(dir.path().join(INSTALL_MARKER), "").unwrap();
+        assert!(installed(dir.path()));
+    }
+
+    #[test]
+    fn selection_uses_this_platforms_manifest_and_archive() {
+        #[cfg(not(windows))]
+        {
+            assert!(MANIFEST_URL.ends_with("/update-linux.json"));
+            assert_eq!(ARCHIVE_FILE, "update-linux.zip");
+            assert_eq!(INSTALL_MARKER, ".installed");
+        }
+        #[cfg(windows)]
+        {
+            assert!(MANIFEST_URL.ends_with("/update.json"));
+            assert_eq!(ARCHIVE_FILE, "update.zip");
+            assert_eq!(INSTALL_MARKER, "unins000.exe");
+        }
+        assert!(archive_url_is_trusted(&format!(
+            "{DOWNLOAD_PREFIX}v1.2.3/{ARCHIVE_FILE}"
+        )));
+        let other = if cfg!(windows) {
+            "update-linux.zip"
+        } else {
+            "update.zip"
+        };
+        assert!(!archive_url_is_trusted(&format!(
+            "{DOWNLOAD_PREFIX}v1.2.3/{other}"
+        )));
+        assert!(!archive_url_is_trusted("https://example.com/update.zip"));
+        assert!(!archive_url_is_trusted(""));
     }
 
     #[test]

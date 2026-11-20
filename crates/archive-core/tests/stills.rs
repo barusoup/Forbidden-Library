@@ -9,21 +9,24 @@ use std::process::Command;
 use std::sync::Once;
 use tempfile::TempDir;
 
-/// Point the engine at the bundled ffmpeg for this process, when it is
-/// present. Discovery is cached, so this runs before any test discovers tools.
-fn point_at_bundled_ffmpeg() {
+/// The ffmpeg this process can use. A development checkout that has downloaded
+/// the bundled build points the engine at it; otherwise discovery finds
+/// `ffmpeg` beside the app or on `PATH`. Discovery is cached, so this runs
+/// before any test discovers tools.
+fn ffmpeg() -> Option<std::path::PathBuf> {
     static POINT: Once = Once::new();
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/ffmpeg");
-    if !dir.join("ffmpeg.exe").is_file() {
-        return;
-    }
     POINT.call_once(|| {
-        // SAFETY: set before this process starts any engine work, because every
-        // test calls this first and `Once` makes the others wait for it.
-        unsafe {
-            std::env::set_var("FORBIDDEN_LIBRARY_FFMPEG_DIR", &dir);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/ffmpeg");
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        if dir.join(format!("ffmpeg{suffix}")).is_file() {
+            // SAFETY: set before this process starts any engine work, because
+            // every test calls this first and `Once` makes the others wait.
+            unsafe {
+                std::env::set_var("FORBIDDEN_LIBRARY_FFMPEG_DIR", &dir);
+            }
         }
     });
+    Tools::discover().ffmpeg
 }
 
 /// A picture with edges, gradients and colours the AVIF encoder has to
@@ -40,8 +43,7 @@ fn picture(width: u32, height: u32) -> RgbImage {
 
 #[test]
 fn a_lossless_still_the_rust_decoders_cannot_read_comes_back_exactly() {
-    point_at_bundled_ffmpeg();
-    let Some(ffmpeg) = Tools::discover().ffmpeg else {
+    let Some(ffmpeg) = ffmpeg() else {
         eprintln!("skipping: ffmpeg was not found");
         return;
     };

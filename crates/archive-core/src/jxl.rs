@@ -162,20 +162,27 @@ mod tests {
     use image::codecs::jpeg::JpegEncoder;
     use image::{GenericImageView, Rgb, RgbImage};
 
-    /// The tools next to the repository's assets, or the directory named by
-    /// `FORBIDDEN_LIBRARY_JXL_DIR`. `None` when they are not there.
+    /// The tools JPEG XL needs, when this machine has them. A development
+    /// checkout that has downloaded the bundled tools uses those directly;
+    /// otherwise discovery finds `cjxl` and `djxl` beside the app or on
+    /// `PATH`, which is how a Linux build runs these tests.
     fn test_tools() -> Option<Tools> {
         let dir = std::env::var_os("FORBIDDEN_LIBRARY_JXL_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/jxl"));
-        let cjxl = dir.join("cjxl.exe");
-        let djxl = dir.join("djxl.exe");
-        (cjxl.is_file() && djxl.is_file()).then_some(Tools {
-            ffmpeg: None,
-            ffprobe: None,
-            cjxl: Some(cjxl),
-            djxl: Some(djxl),
-        })
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let cjxl = dir.join(format!("cjxl{suffix}"));
+        let djxl = dir.join(format!("djxl{suffix}"));
+        if cjxl.is_file() && djxl.is_file() {
+            return Some(Tools {
+                ffmpeg: None,
+                ffprobe: None,
+                cjxl: Some(cjxl),
+                djxl: Some(djxl),
+            });
+        }
+        let tools = Tools::discover();
+        tools.has_jxl().then_some(tools)
     }
 
     /// A non-square JPEG whose EXIF orientation is `orientation`. The pixels
@@ -220,7 +227,7 @@ mod tests {
     #[test]
     fn a_transcoded_jpeg_is_rebuilt_byte_for_byte() {
         let Some(tools) = test_tools() else {
-            eprintln!("skipping: assets/jxl is not present");
+            eprintln!("skipping: cjxl and djxl were not found");
             return;
         };
         let temp = tempfile::tempdir().unwrap();
@@ -238,7 +245,7 @@ mod tests {
     #[test]
     fn a_transcoded_jpeg_turns_upright_exactly_once() {
         let Some(tools) = test_tools() else {
-            eprintln!("skipping: assets/jxl is not present");
+            eprintln!("skipping: cjxl and djxl were not found");
             return;
         };
         let temp = tempfile::tempdir().unwrap();
@@ -262,7 +269,7 @@ mod tests {
     #[test]
     fn a_lossless_encode_decodes_to_the_same_samples_at_sixteen_bits() {
         let Some(tools) = test_tools() else {
-            eprintln!("skipping: assets/jxl is not present");
+            eprintln!("skipping: cjxl and djxl were not found");
             return;
         };
         let temp = tempfile::tempdir().unwrap();
@@ -288,7 +295,7 @@ mod tests {
     #[test]
     fn the_header_reports_the_size_the_decoder_returns() {
         let Some(tools) = test_tools() else {
-            eprintln!("skipping: assets/jxl is not present");
+            eprintln!("skipping: cjxl and djxl were not found");
             return;
         };
         let temp = tempfile::tempdir().unwrap();

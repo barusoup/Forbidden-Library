@@ -39,5 +39,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# Process-group containment, rlimits and read-ahead advice for the tools and
+# the import path. The Windows job object needs windows-sys for the same work.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

@@ -1,13 +1,13 @@
 //! Forbidden Library — the app.
 //!
-//! The window hosts the immediate-mode UI in [`app`] on Dream's Vulkan
-//! renderer. All storage work happens on background threads; the event loop
-//! only renders when a frame can have changed, and workers wake it through
-//! the event-loop proxy.
+//! The window, renderer, UI and frame loop belong to Dream's app runner
+//! ([`dream::ui::app::run`]); the app in [`app`] fills the frames it asks for
+//! and keeps all storage work on background threads, waking the runner when
+//! results land.
 //!
 //! ```text
 //! forbidden-library                 # the app
-//! forbidden-library --selfcheck     # headless UI + engine check, prints a summary
+//! forbidden-library --selfcheck     # headless engine + UI check
 //! forbidden-library --rendercheck   # headless render of every page and the viewer
 //! forbidden-library --backup <dir>  # consistent copy of the whole library
 //! ```
@@ -18,6 +18,7 @@
 )]
 
 mod app;
+mod autolock;
 mod details;
 mod fonts;
 mod grid;
@@ -34,262 +35,183 @@ mod viewer;
 mod worker;
 
 use app::ArchiveApp;
-use std::collections::VecDeque;
+use dream::ui::app::{AppContext, AppOptions, UiApp, run};
+use dream::ui::widgets::Ui;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key as WinitKey, NamedKey};
-use winit::window::{CursorIcon, Theme, Window, WindowId};
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::window::{Theme, Window};
 
-struct Host {
+/// The shipped app: the Dream runner owns the window, renderer, UI and the
+/// scheduling; this holds the archive on top of it.
+struct LibraryApp {
     app: Option<ArchiveApp>,
-    window: Option<Arc<Window>>,
-    proxy: EventLoopProxy<()>,
-    dropped: VecDeque<PathBuf>,
-    last_drop: Option<Instant>,
-    cursor: Option<CursorIcon>,
-    rendercheck: bool,
-    /// Set when a rendercheck step fails, so the process exits non-zero.
-    rendercheck_failed: bool,
-    sources: Vec<PathBuf>,
-    /// The window is fully covered by other windows (platforms that report it).
-    occluded: bool,
-    /// The hidden state last acted on, so a hide or show is handled once.
-    hidden_applied: bool,
-    /// When the last frame was drawn, for pacing the next one.
-    last_render: Instant,
-    /// The monitor's refresh period and when it was read.
-    refresh: Option<(Instant, Duration)>,
-    /// When to return the working set to the OS: after warm-up and quiet spells.
-    memory: dream::memory::IdleTrim,
+    /// Wakes the runner for the app's own timers, which the runner cannot see.
+    deadline: Option<Deadline>,
+    /// The OS appearance last applied, so a theme change is noticed once.
+    last_dark: Option<bool>,
 }
 
-/// The fastest the UI animates. A high-refresh monitor would otherwise ask for
-/// several times the frames of a 60 Hz one for the same motion; 120 Hz is
-/// already past what UI motion needs.
-const MOTION_FPS: f32 = 120.0;
-
-impl Host {
-    fn new(proxy: EventLoopProxy<()>, rendercheck: bool, sources: Vec<PathBuf>) -> Self {
+impl LibraryApp {
+    fn new() -> Self {
         Self {
             app: None,
-            window: None,
-            proxy,
-            dropped: VecDeque::new(),
-            last_drop: None,
-            cursor: None,
-            rendercheck,
-            rendercheck_failed: false,
-            sources,
-            occluded: false,
-            hidden_applied: false,
-            last_render: Instant::now(),
-            refresh: None,
-            memory: dream::memory::IdleTrim::new(),
+            deadline: None,
+            last_dark: None,
         }
     }
+}
 
-    /// Minimised or fully covered: nothing drawn could be seen.
-    fn hidden(&self) -> bool {
-        self.occluded
-            || self
-                .window
-                .as_ref()
-                .and_then(|window| window.is_minimized())
-                .unwrap_or(false)
-    }
-
-    /// Act on a hide or show once. A hidden window draws nothing, so the
-    /// renderer's idle buffers and the process's cold pages go back now.
-    fn apply_hidden(&mut self, hidden: bool) {
-        if self.hidden_applied == hidden {
-            return;
-        }
-        self.hidden_applied = hidden;
-        if hidden {
-            if let Some(renderer) = self.app.as_mut().and_then(|app| app.renderer.as_mut()) {
-                renderer.release_scene_resources();
-                renderer.trim_memory();
+impl UiApp for LibraryApp {
+    fn init(&mut self, ui: &mut Ui, cx: &mut AppContext<'_>) {
+        crate::fonts::install(ui);
+        apply_window_icon(cx.window());
+        let dark = system_dark(cx.window());
+        let scale = cx.scale();
+        let screen = cx.screen();
+        let context = Arc::clone(cx.renderer().context());
+        let waker = cx.waker();
+        let wake = worker::Wake::new(move || waker.wake());
+        match ArchiveApp::attached(dark, context, wake.clone(), scale, (screen.w, screen.h)) {
+            Ok(app) => {
+                self.app = Some(app);
+                self.deadline = Some(Deadline::start(wake));
+                self.last_dark = Some(dark);
             }
-            dream::memory::trim_working_set();
-            self.memory = dream::memory::IdleTrim::new();
-        } else {
-            self.request_redraw();
+            Err(error) => fatal(&format!(
+                "Forbidden Library could not open its library.\n\n{error}\n\nYour files were not modified."
+            )),
         }
     }
 
-    /// Time between frames while something moves: one per refresh of the
-    /// window's monitor, capped at [`MOTION_FPS`]. Pacing in software, rather
-    /// than letting the swapchain block, keeps some drivers from busy-waiting a
-    /// whole core inside the present wait.
-    fn frame_period(&mut self, now: Instant) -> Duration {
-        if let Some((read, period)) = self.refresh
-            && now.duration_since(read) < Duration::from_millis(500)
-        {
-            return period;
+    fn view(&mut self, ui: &mut Ui, cx: &mut AppContext<'_>) {
+        let Some(app) = self.app.as_mut() else { return };
+        let now = Instant::now();
+        let dark = system_dark(cx.window());
+        if self.last_dark != Some(dark) {
+            self.last_dark = Some(dark);
+            app.set_system_dark(dark);
         }
-        let hz = self
-            .window
-            .as_ref()
-            .and_then(|window| window.current_monitor())
-            .and_then(|monitor| monitor.refresh_rate_millihertz())
-            .map(|millihertz| millihertz as f32 / 1000.0)
-            .filter(|hz| hz.is_finite() && *hz > 1.0)
-            .unwrap_or(60.0)
-            .min(MOTION_FPS);
-        let period = Duration::from_secs_f32(1.0 / hz.clamp(10.0, 1000.0));
-        self.refresh = Some((now, period));
-        period
-    }
-
-    fn request_redraw(&self) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        let scale = cx.scale();
+        let screen = cx.screen();
+        let input = ui.input().clone();
+        let wants_more = app.runner_frame(ui, &input, scale, (screen.w, screen.h), now);
+        if wants_more {
+            cx.request_frame();
+        }
+        if let Some(deadline) = self.deadline.as_ref() {
+            deadline.set(app.next_wake(now));
         }
     }
 
-    fn flush_drops(&mut self) {
-        if self.dropped.is_empty() {
-            return;
-        }
-        let paths: Vec<PathBuf> = self.dropped.drain(..).collect();
+    fn files_dropped(&mut self, paths: Vec<PathBuf>, cx: &mut AppContext<'_>) {
         if let Some(app) = self.app.as_mut() {
             app.dropped(paths);
-        }
-        self.last_drop = None;
-        self.request_redraw();
-    }
-
-    fn run_rendercheck(&mut self, event_loop: &ActiveEventLoop) {
-        let Some(app) = self.app.as_mut() else { return };
-        // Frames go straight to the swapchain unless capture is on, and the
-        // check reads them back.
-        if let Some(renderer) = app.renderer.as_mut() {
-            renderer.set_frame_capture(true);
-        }
-        let report = archive_core::import_paths(
-            &app.library,
-            &self.sources,
-            &archive_core::ImportOptions::default(),
-            &mut |_| {},
-        );
-        if report.imported == 0 && report.duplicates == 0 {
-            eprintln!("rendercheck: no media imported ({report:?})");
-            self.rendercheck_failed = true;
-            event_loop.exit();
-            return;
-        }
-        app.reload();
-        let pages = [
-            app::Page::Media,
-            app::Page::Albums,
-            app::Page::Collections,
-            app::Page::Trash,
-            app::Page::Settings,
-        ];
-        let mut checked = Vec::new();
-        for page in pages {
-            app.set_page(page.clone());
-            for _ in 0..42 {
-                app.render(Instant::now());
-                std::thread::sleep(Duration::from_millis(8));
-            }
-            let Some(renderer) = app.renderer.as_mut() else {
-                eprintln!("rendercheck: renderer missing");
-                self.rendercheck_failed = true;
-                event_loop.exit();
-                return;
-            };
-            let (pixels, width, height) = renderer.capture_rgba8();
-            if width == 0 || height == 0 || pixels.len() != (width * height * 4) as usize {
-                eprintln!("rendercheck: bad capture {width}x{height}");
-                self.rendercheck_failed = true;
-                event_loop.exit();
-                return;
-            }
-            let stats = pixel_stats(&pixels);
-            let dir = std::env::var_os("FORBIDDEN_LIBRARY_RENDERCHECK_DIR").map(PathBuf::from);
-            if let Some(dir) = &dir {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if let Err(error) = save_capture(
-                dir.as_deref(),
-                &format!("page-{page:?}"),
-                &pixels,
-                width,
-                height,
-            ) {
-                eprintln!("rendercheck: {error}");
-                self.rendercheck_failed = true;
-                event_loop.exit();
-                return;
-            }
-            let minimum = if page.is_media() { 0.002 } else { 0.004 };
-            if stats.colors < 10 || stats.ink_fraction < minimum {
-                eprintln!("rendercheck: {page:?} looks blank ({:?})", stats);
-                self.rendercheck_failed = true;
-                event_loop.exit();
-                return;
-            }
-            checked.push((page, stats));
-        }
-        for (page, stats) in &checked {
-            println!(
-                "rendercheck {page:?}: {} colours, {:.1}% ink, background {:02x}{:02x}{:02x}",
-                stats.colors,
-                stats.ink_fraction * 100.0,
-                stats.background.0,
-                stats.background.1,
-                stats.background.2
-            );
-        }
-        if let Err(error) = app.check_import_dialogs() {
-            eprintln!("rendercheck import dialogs: {error}");
-            self.rendercheck_failed = true;
-            event_loop.exit();
-            return;
-        }
-        println!(
-            "rendercheck ok · {} pages and import dialogs rendered",
-            checked.len()
-        );
-
-        // The viewer: a video, an animation, a still and the largest still,
-        // each opened and watched for a moment.
-        if let Err(error) = check_viewers(app) {
-            eprintln!("rendercheck viewer: {error}");
-            self.rendercheck_failed = true;
-            event_loop.exit();
-            return;
-        }
-        event_loop.exit();
-    }
-
-    fn update_cursor(&mut self) {
-        let Some(app) = self.app.as_ref() else { return };
-        let wanted = if app.cursor_hand {
-            CursorIcon::Pointer
-        } else {
-            CursorIcon::Default
-        };
-        if self.cursor != Some(wanted) {
-            self.cursor = Some(wanted);
-            if let Some(window) = &self.window {
-                window.set_cursor(wanted);
-            }
+            cx.request_frame();
         }
     }
+
+    fn close_requested(&mut self, _cx: &mut AppContext<'_>) -> bool {
+        // Unlocked collections are sealed before the window goes, so no key
+        // outlives it.
+        if let Some(app) = self.app.as_mut() {
+            app.lock_for_exit();
+        }
+        true
+    }
+}
+
+/// Wakes the runner when one of the app's own timers falls due — a caret
+/// blink, a video bar fading out, the idle countdown. The runner knows only
+/// about Dream's timers; anything the app schedules has to be posted from a
+/// thread, which is exactly what [`dream::ui::app::AppWaker`] is for.
+struct Deadline {
+    tx: Sender<Option<Instant>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Deadline {
+    fn start(wake: worker::Wake) -> Self {
+        let (tx, rx) = channel::<Option<Instant>>();
+        let thread = std::thread::Builder::new()
+            .name("forbiddenlibrary-timer".into())
+            .spawn(move || {
+                let mut deadline: Option<Instant> = None;
+                loop {
+                    let next = match deadline {
+                        Some(at) => {
+                            match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                                Ok(next) => next,
+                                Err(RecvTimeoutError::Timeout) => {
+                                    deadline = None;
+                                    wake.wake();
+                                    continue;
+                                }
+                                // The app is gone.
+                                Err(RecvTimeoutError::Disconnected) => return,
+                            }
+                        }
+                        None => match rx.recv() {
+                            Ok(next) => next,
+                            Err(_) => return,
+                        },
+                    };
+                    match next {
+                        Some(at) => deadline = Some(at),
+                        // The app is gone.
+                        None => return,
+                    }
+                }
+            })
+            .ok();
+        Self { tx, thread }
+    }
+
+    fn set(&self, at: Option<Instant>) {
+        let _ = self.tx.send(at);
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        // Closing the channel ends the thread's wait.
+        let _ = self.tx.send(None);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn system_dark(window: &Window) -> bool {
+    window.theme().is_none_or(|theme| theme == Theme::Dark)
+}
+
+/// The window icon, from the PNG the installer uses. Wayland takes the icon
+/// from the desktop entry instead, so this is for X11.
+#[cfg(not(windows))]
+fn apply_window_icon(window: &Window) {
+    const PNG: &[u8] = include_bytes!("../../../assets/icon/app-icon.png");
+    let Ok(image) = image::load_from_memory_with_format(PNG, image::ImageFormat::Png) else {
+        return;
+    };
+    let (width, height) = (image.width(), image.height());
+    let Ok(icon) = winit::window::Icon::from_rgba(image.into_rgba8().into_raw(), width, height)
+    else {
+        return;
+    };
+    window.set_window_icon(Some(icon));
 }
 
 /// Gives the window the icon embedded in the executable. Windows picks the
 /// taskbar and Alt+Tab icon from the large one and the title bar from the
 /// small one, so both are loaded at their system sizes.
 #[cfg(windows)]
-fn apply_exe_icon(window: &Window) {
+fn apply_window_icon(window: &Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -317,278 +239,6 @@ fn apply_exe_icon(window: &Window) {
     }
 }
 
-#[cfg(not(windows))]
-fn apply_exe_icon(_window: &Window) {}
-
-impl ApplicationHandler for Host {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attributes = Window::default_attributes()
-            .with_title("Forbidden Library")
-            .with_inner_size(LogicalSize::new(1440.0f64, 900.0f64))
-            .with_min_inner_size(LogicalSize::new(1040.0f64, 660.0f64))
-            .with_visible(!self.rendercheck);
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
-            Err(error) => {
-                fatal(&format!("The window could not be created.\n\n{error}"));
-                return;
-            }
-        };
-        window.set_ime_allowed(true);
-        apply_exe_icon(&window);
-        self.window = Some(Arc::clone(&window));
-        match ArchiveApp::new(Arc::clone(&window), self.proxy.clone()) {
-            Ok(app) => {
-                self.app = Some(app);
-                if self.rendercheck {
-                    self.run_rendercheck(event_loop);
-                } else {
-                    window.request_redraw();
-                }
-            }
-            Err(error) => {
-                fatal(&format!(
-                    "Forbidden Library could not open its library.\n\n{error}\n\nYour files were not modified."
-                ));
-            }
-        }
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        // Read before `app` borrows `self` for the rest of the handler.
-        let hidden = self.hidden();
-        let Some(app) = self.app.as_mut() else {
-            return;
-        };
-        // Pointer, wheel, key and drop activity inside the window keeps unlocked
-        // collections open. Other events, such as the pointer leaving, do not.
-        if matches!(
-            event,
-            WindowEvent::CursorMoved { .. }
-                | WindowEvent::MouseInput { .. }
-                | WindowEvent::MouseWheel { .. }
-                | WindowEvent::KeyboardInput { .. }
-                | WindowEvent::DroppedFile(_)
-        ) {
-            app.note_activity();
-        }
-        match event {
-            WindowEvent::CloseRequested => {
-                // Unlocked collections are sealed before the window goes, so no
-                // key outlives it.
-                app.lock_for_exit();
-                event_loop.exit();
-            }
-            WindowEvent::RedrawRequested => {
-                let now = Instant::now();
-                if hidden {
-                    // Nothing can be seen: keep the timers honest, draw nothing.
-                    app.idle_tick(now);
-                    return;
-                }
-                app.render(now);
-                self.last_render = now;
-                self.memory.activity(now);
-                // The next frame, if one is wanted, is scheduled in
-                // `about_to_wait`, paced to the display.
-                self.update_cursor();
-            }
-            WindowEvent::Occluded(occluded) => {
-                self.occluded = occluded;
-            }
-            WindowEvent::Resized(size) => {
-                // Minimised (or otherwise zero-sized) windows have nothing to
-                // draw into: keep the old swapchain until a real size arrives.
-                if size.width == 0 || size.height == 0 {
-                    return;
-                }
-                if let Some(renderer) = app.renderer.as_mut() {
-                    renderer.resize(size);
-                }
-                app.resize((size.width, size.height));
-                self.request_redraw();
-            }
-            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                app.set_scale(scale_factor as f32);
-                if let Some(window) = &self.window {
-                    let size = window.inner_size();
-                    if size.width > 0 && size.height > 0 {
-                        if let Some(renderer) = app.renderer.as_mut() {
-                            renderer.resize(size);
-                        }
-                        app.resize((size.width, size.height));
-                        window.request_redraw();
-                    }
-                }
-            }
-            WindowEvent::ThemeChanged(theme) => {
-                app.set_system_dark(theme == Theme::Dark);
-                self.request_redraw();
-            }
-            WindowEvent::Focused(true) => {
-                app.observe_theme();
-                self.request_redraw();
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                let scale = app.scale.max(0.5);
-                app.pointer_moved((position.x as f32 / scale, position.y as f32 / scale));
-                self.request_redraw();
-            }
-            WindowEvent::CursorLeft { .. } => {
-                app.pointer_moved((-10_000.0, -10_000.0));
-                self.request_redraw();
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                app.pointer_button(state == ElementState::Pressed);
-                self.request_redraw();
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } => {
-                app.pointer_secondary();
-                self.request_redraw();
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                match delta {
-                    MouseScrollDelta::LineDelta(_, y) => app.wheel(y * 54.0, 0.0),
-                    MouseScrollDelta::PixelDelta(position) => app.wheel(0.0, position.y as f32),
-                }
-                self.request_redraw();
-            }
-            WindowEvent::ModifiersChanged(modifiers) => {
-                let state = modifiers.state();
-                app.modifiers(state.control_key(), state.shift_key());
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(key) = map_key(&event) {
-                    app.key(key, event.state == ElementState::Pressed);
-                }
-                if event.state == ElementState::Pressed
-                    && !app.input.ctrl
-                    && let Some(text) = event.text.as_deref()
-                    && !text.chars().any(|c| c.is_control())
-                {
-                    app.text_input(text);
-                }
-                self.request_redraw();
-            }
-            WindowEvent::DroppedFile(path) => {
-                self.dropped.push_back(path);
-                self.last_drop = Some(Instant::now());
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(150),
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        self.request_redraw();
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-        let hidden = self.hidden();
-        self.apply_hidden(hidden);
-        if hidden {
-            // Only the unlocked-collection timer matters while hidden; video
-            // and animation wait for the window to show again.
-            if let Some(app) = self.app.as_mut() {
-                if app.hidden_wake().is_some_and(|at| at <= now) {
-                    app.idle_tick(now);
-                }
-                match app.hidden_wake() {
-                    Some(at) if at > now => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-                    _ => event_loop.set_control_flow(ControlFlow::Wait),
-                }
-            }
-            return;
-        }
-        if self.memory.trim_if_due(now) {
-            dream::memory::trim_working_set();
-        }
-        let mut drop_due = None;
-        if let Some(last) = self.last_drop {
-            let due = last + Duration::from_millis(150);
-            if now >= due {
-                self.flush_drops();
-            } else {
-                drop_due = Some(due);
-            }
-        }
-        let (wants, wake) = match self.app.as_ref() {
-            Some(app) => (app.wants_frame(), app.next_wake(now)),
-            None => (false, None),
-        };
-        if let Some(due) = drop_due {
-            // While a drop is being debounced, only a wake-up that is due may
-            // redraw. Frames that merely want to run wait for the drop to settle.
-            if wake.is_some_and(|at| at <= now) {
-                self.request_redraw();
-            }
-            let wait = match wake {
-                Some(at) if at > now => at.min(due),
-                _ => due,
-            };
-            event_loop.set_control_flow(ControlFlow::WaitUntil(wait));
-            return;
-        }
-        if wants {
-            let due = self.last_render + self.frame_period(now);
-            if now >= due {
-                self.request_redraw();
-                event_loop.set_control_flow(ControlFlow::Wait);
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
-            }
-            return;
-        }
-        if wake.is_some_and(|at| at <= now) {
-            self.request_redraw();
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        }
-        match wake.into_iter().chain(self.memory.next_deadline()).min() {
-            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
-        }
-    }
-}
-
-fn map_key(event: &winit::event::KeyEvent) -> Option<dream::ui::widgets::Key> {
-    use dream::ui::widgets::Key;
-    match &event.logical_key {
-        WinitKey::Named(NamedKey::Escape) => Some(Key::Escape),
-        WinitKey::Named(NamedKey::Enter) => Some(Key::Enter),
-        WinitKey::Named(NamedKey::Tab) => Some(Key::Tab),
-        WinitKey::Named(NamedKey::Backspace) => Some(Key::Backspace),
-        WinitKey::Named(NamedKey::Delete) => Some(Key::Delete),
-        WinitKey::Named(NamedKey::ArrowLeft) => Some(Key::Left),
-        WinitKey::Named(NamedKey::ArrowRight) => Some(Key::Right),
-        WinitKey::Named(NamedKey::ArrowUp) => Some(Key::Up),
-        WinitKey::Named(NamedKey::ArrowDown) => Some(Key::Down),
-        WinitKey::Named(NamedKey::Home) => Some(Key::Home),
-        WinitKey::Named(NamedKey::End) => Some(Key::End),
-        WinitKey::Named(NamedKey::PageUp) => Some(Key::PageUp),
-        WinitKey::Named(NamedKey::PageDown) => Some(Key::PageDown),
-        WinitKey::Named(NamedKey::Space) => Some(Key::Char(' ')),
-        WinitKey::Character(text) => text.chars().next().map(Key::Char),
-        _ => None,
-    }
-}
-
 fn fatal(message: &str) {
     eprintln!("{message}");
     #[cfg(windows)]
@@ -603,6 +253,18 @@ fn fatal(message: &str) {
                 title.as_ptr(),
                 MB_OK | MB_ICONERROR,
             );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // A window can fail before there is anything on screen to show the
+        // message in; a dialog is the only place a desktop user would look.
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            let _ = rfd::MessageDialog::new()
+                .set_title("Forbidden Library")
+                .set_description(message)
+                .set_level(rfd::MessageLevel::Error)
+                .show();
         }
     }
     std::process::exit(1);
@@ -658,108 +320,261 @@ fn main() {
         return;
     }
 
-    let rendercheck = args.iter().any(|arg| arg == "--rendercheck");
-    let mut check_root = None;
-    let mut sources = Vec::new();
-    if rendercheck {
-        let root = std::env::temp_dir().join(format!(
-            "forbiddenlibrary-rendercheck-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        if let Err(error) = std::fs::create_dir_all(root.join("media")) {
-            fatal(&format!(
-                "rendercheck could not prepare its library: {error}"
-            ));
-            return;
-        }
-        // SAFETY: set before any thread reads the environment.
-        unsafe {
-            std::env::set_var("FORBIDDEN_LIBRARY_DATA_DIR", &root);
-        }
-        let palette = [
-            (220u8, 226u8, 232u8),
-            (35u8, 38u8, 44u8),
-            (188u8, 174u8, 150u8),
-            (120u8, 139u8, 156u8),
-            (238u8, 205u8, 180u8),
-            (74u8, 86u8, 70u8),
-        ];
-        for index in 0..8u32 {
-            // Sample 0 is larger than the viewer's 2048 px preview, so the
-            // largest-still check actually reaches the full-resolution decode.
-            let (width, height) = if index == 0 {
-                (2400, 1600)
-            } else {
-                (120 + (index % 3) * 40, 90 + (index % 2) * 40)
-            };
-            let mut pixels = vec![0u8; (width * height * 4) as usize];
-            let (r, g, b) = palette[index as usize % palette.len()];
-            for (position, pixel) in pixels.chunks_exact_mut(4).enumerate() {
-                let x = position as u32 % width;
-                let y = position as u32 / width;
-                pixel[0] = (r as u32 + x / 6).min(255) as u8;
-                pixel[1] = (g as u32 + y / 8).min(255) as u8;
-                pixel[2] = b;
-                pixel[3] = 255;
-            }
-            let path = root.join("media").join(format!("frame-{index}.png"));
-            if std::fs::write(&path, dream::png::encode(width, height, &pixels)).is_err() {
-                fatal("rendercheck could not write its sample images.");
-                return;
-            }
-            sources.push(path);
-        }
-        // Extra media for the viewer checks, such as a video and an animated
-        // GIF, which the generated stills do not cover.
-        if let Some(extra) = std::env::var_os("FORBIDDEN_LIBRARY_RENDERCHECK_MEDIA") {
-            match std::fs::read_dir(&extra) {
-                Ok(entries) => {
-                    let mut files: Vec<PathBuf> = entries
-                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                        .filter(|path| path.is_file())
-                        .collect();
-                    files.sort();
-                    sources.extend(files);
-                }
-                Err(error) => {
-                    fatal(&format!(
-                        "rendercheck could not read its media folder: {error}"
-                    ));
-                    return;
-                }
-            }
-        }
-        check_root = Some(root);
+    if args.iter().any(|arg| arg == "--rendercheck") {
+        std::process::exit(rendercheck(&args));
     }
 
-    let event_loop = match EventLoop::<()>::with_user_event().build() {
-        Ok(event_loop) => event_loop,
-        Err(error) => {
-            fatal(&format!("The app could not start.\n\n{error}"));
-            return;
-        }
-    };
-    event_loop.set_control_flow(ControlFlow::Wait);
-    let proxy = event_loop.create_proxy();
-    let mut host = Host::new(proxy, rendercheck, sources);
-    if let Err(error) = event_loop.run_app(&mut host) {
+    // A local photo library is not a game: prefer the integrated GPU when the
+    // machine has one, and fall back to whatever GPU is there otherwise.
+    let options = AppOptions {
+        title: "Forbidden Library".into(),
+        size: (1440.0, 900.0),
+        min_size: Some((1040.0, 660.0)),
+        ..Default::default()
+    }
+    .app_id("forbidden-library")
+    .low_power_gpu(true);
+    if let Err(error) = run(options, LibraryApp::new()) {
         fatal(&format!(
             "Forbidden Library stopped unexpectedly.\n\n{error}"
         ));
     }
-    let rendercheck_failed = host.rendercheck_failed;
-    drop(host);
-    if let Some(root) = check_root {
-        let _ = std::fs::remove_dir_all(root);
+}
+
+/// The `--rendercheck` harness. It keeps its own tiny window loop because it
+/// scripts frames: every page is drawn a set number of times and read back,
+/// which the runner has no way to drive from outside.
+struct Harness {
+    app: Option<ArchiveApp>,
+    sources: Vec<PathBuf>,
+    failed: bool,
+    proxy: EventLoopProxy<()>,
+}
+
+impl ApplicationHandler for Harness {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let attributes = Window::default_attributes()
+            .with_title("Forbidden Library render check")
+            .with_inner_size(LogicalSize::new(1440.0f64, 900.0f64))
+            .with_visible(false);
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                eprintln!("rendercheck: the window could not be created: {error}");
+                self.failed = true;
+                event_loop.exit();
+                return;
+            }
+        };
+        let proxy = self.proxy.clone();
+        let wake = worker::Wake::new(move || {
+            let _ = proxy.send_event(());
+        });
+        match ArchiveApp::new(window, wake) {
+            Ok(mut app) => {
+                if let Err(error) = run_rendercheck(&mut app, &self.sources) {
+                    eprintln!("rendercheck: {error}");
+                    self.failed = true;
+                }
+                self.app = Some(app);
+            }
+            Err(error) => {
+                eprintln!("rendercheck: the library would not open: {error}");
+                self.failed = true;
+            }
+        }
+        event_loop.exit();
     }
-    if rendercheck_failed {
-        std::process::exit(1);
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if matches!(event, WindowEvent::CloseRequested) {
+            event_loop.exit();
+        }
     }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {}
+}
+
+/// Builds the sample library the check renders, runs the check, and returns
+/// the process exit code.
+fn rendercheck(args: &[String]) -> i32 {
+    let root = std::env::temp_dir().join(format!(
+        "forbiddenlibrary-rendercheck-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    if let Err(error) = std::fs::create_dir_all(root.join("media")) {
+        eprintln!("rendercheck could not prepare its library: {error}");
+        return 1;
+    }
+    // SAFETY: set before any thread reads the environment.
+    unsafe {
+        std::env::set_var("FORBIDDEN_LIBRARY_DATA_DIR", &root);
+    }
+    let palette = [
+        (220u8, 226u8, 232u8),
+        (35u8, 38u8, 44u8),
+        (188u8, 174u8, 150u8),
+        (120u8, 139u8, 156u8),
+        (238u8, 205u8, 180u8),
+        (74u8, 86u8, 70u8),
+    ];
+    let mut sources = Vec::new();
+    for index in 0..8u32 {
+        // Sample 0 is larger than the viewer's 2048 px preview, so the
+        // largest-still check actually reaches the full-resolution decode.
+        let (width, height) = if index == 0 {
+            (2400, 1600)
+        } else {
+            (120 + (index % 3) * 40, 90 + (index % 2) * 40)
+        };
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        let (r, g, b) = palette[index as usize % palette.len()];
+        for (position, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let x = position as u32 % width;
+            let y = position as u32 / width;
+            pixel[0] = (r as u32 + x / 6).min(255) as u8;
+            pixel[1] = (g as u32 + y / 8).min(255) as u8;
+            pixel[2] = b;
+            pixel[3] = 255;
+        }
+        let path = root.join("media").join(format!("frame-{index}.png"));
+        if std::fs::write(&path, dream::png::encode(width, height, &pixels)).is_err() {
+            eprintln!("rendercheck could not write its sample images.");
+            return 1;
+        }
+        sources.push(path);
+    }
+    // Extra media for the viewer checks, such as a video and an animated
+    // GIF, which the generated stills do not cover.
+    if let Some(extra) = std::env::var_os("FORBIDDEN_LIBRARY_RENDERCHECK_MEDIA") {
+        match std::fs::read_dir(&extra) {
+            Ok(entries) => {
+                let mut files: Vec<PathBuf> = entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path.is_file())
+                    .collect();
+                files.sort();
+                sources.extend(files);
+            }
+            Err(error) => {
+                eprintln!("rendercheck could not read its media folder: {error}");
+                return 1;
+            }
+        }
+    }
+    let _ = args;
+
+    let event_loop = match EventLoop::<()>::with_user_event().build() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            eprintln!("rendercheck could not start: {error}");
+            return 1;
+        }
+    };
+    let proxy = event_loop.create_proxy();
+    let mut harness = Harness {
+        app: None,
+        sources,
+        failed: false,
+        proxy,
+    };
+    if let Err(error) = event_loop.run_app(&mut harness) {
+        eprintln!("rendercheck stopped unexpectedly: {error}");
+        let _ = std::fs::remove_dir_all(&root);
+        return 1;
+    }
+    let failed = harness.failed;
+    drop(harness);
+    let _ = std::fs::remove_dir_all(root);
+    i32::from(failed)
+}
+
+/// Imports the samples, draws every page and the viewer, and checks the
+/// captures are not blank. Returns what went wrong, if anything.
+fn run_rendercheck(app: &mut ArchiveApp, sources: &[PathBuf]) -> Result<(), String> {
+    // Frames go straight to the swapchain unless capture is on, and the
+    // check reads them back.
+    if let Some(renderer) = app.renderer.as_mut() {
+        renderer.set_frame_capture(true);
+    }
+    let report = archive_core::import_paths(
+        &app.library,
+        sources,
+        &archive_core::ImportOptions::default(),
+        &mut |_| {},
+    );
+    if report.imported == 0 && report.duplicates == 0 {
+        return Err(format!("no media imported ({report:?})"));
+    }
+    app.reload();
+    let pages = [
+        app::Page::Media,
+        app::Page::Albums,
+        app::Page::Collections,
+        app::Page::Trash,
+        app::Page::Settings,
+    ];
+    let mut checked = Vec::new();
+    for page in pages {
+        app.set_page(page.clone());
+        for _ in 0..42 {
+            app.render(Instant::now());
+            std::thread::sleep(Duration::from_millis(8));
+        }
+        let Some(renderer) = app.renderer.as_mut() else {
+            return Err("renderer missing".into());
+        };
+        let (pixels, width, height) = renderer.capture_rgba8();
+        if width == 0 || height == 0 || pixels.len() != (width * height * 4) as usize {
+            return Err(format!("bad capture {width}x{height}"));
+        }
+        let stats = pixel_stats(&pixels);
+        let dir = std::env::var_os("FORBIDDEN_LIBRARY_RENDERCHECK_DIR").map(PathBuf::from);
+        if let Some(dir) = &dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        save_capture(
+            dir.as_deref(),
+            &format!("page-{page:?}"),
+            &pixels,
+            width,
+            height,
+        )?;
+        let minimum = if page.is_media() { 0.002 } else { 0.004 };
+        if stats.colors < 10 || stats.ink_fraction < minimum {
+            return Err(format!("{page:?} looks blank ({stats:?})"));
+        }
+        checked.push((page, stats));
+    }
+    for (page, stats) in &checked {
+        println!(
+            "rendercheck {page:?}: {} colours, {:.1}% ink, background {:02x}{:02x}{:02x}",
+            stats.colors,
+            stats.ink_fraction * 100.0,
+            stats.background.0,
+            stats.background.1,
+            stats.background.2
+        );
+    }
+    app.check_import_dialogs()?;
+    println!(
+        "rendercheck ok · {} pages and import dialogs rendered",
+        checked.len()
+    );
+
+    // The viewer: a video, an animation, a still and the largest still,
+    // each opened and watched for a moment.
+    check_viewers(app)
 }
 
 #[derive(Debug)]

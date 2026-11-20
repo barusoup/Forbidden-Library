@@ -30,7 +30,10 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// `%LOCALAPPDATA%\Forbidden Library`. The installer and the app share this.
+    /// The app's private data directory, shared with the installer:
+    /// `%LOCALAPPDATA%\Forbidden Library` on Windows, and
+    /// `$XDG_DATA_HOME/Forbidden Library` (usually
+    /// `~/.local/share/Forbidden Library`) on Linux.
     /// `FORBIDDEN_LIBRARY_DATA_DIR` overrides it for a portable install, testing and
     /// recovery without touching the real profile.
     pub fn data_dir() -> PathBuf {

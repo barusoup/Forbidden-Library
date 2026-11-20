@@ -167,8 +167,9 @@ pub fn remove_unreferenced(paths: &Paths, conn: &Connection, rel: &str) {
 }
 
 /// Open a file for a straight read-through. Windows caches and read-aheads
-/// differently when it knows the access pattern, which is worth a few per
-/// cent on a multi-gigabyte import.
+/// differently when it knows the access pattern; Linux takes the same hint
+/// through `posix_fadvise`. Either is worth a few per cent on a multi-gigabyte
+/// import, and both are only hints.
 fn open_sequential(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -178,5 +179,16 @@ fn open_sequential(path: &Path) -> std::io::Result<File> {
         const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
         options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is open for the life of the call and the
+        // advice only informs the kernel's read-ahead; a failure changes
+        // nothing.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+    }
+    Ok(file)
 }

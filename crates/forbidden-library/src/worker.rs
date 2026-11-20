@@ -9,7 +9,35 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use winit::event_loop::EventLoopProxy;
+
+/// How a background thread asks the UI for a frame.
+///
+/// The app runner hands out a [`dream::ui::app::AppWaker`]; the headless
+/// render-check harness, which drives its own winit loop, wraps the event
+/// loop proxy instead. Both are just "wake the loop", so the workers take
+/// this either way.
+#[derive(Clone)]
+pub struct Wake {
+    send: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl Wake {
+    pub fn new(send: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            send: Arc::new(send),
+        }
+    }
+
+    pub fn wake(&self) {
+        (self.send)();
+    }
+}
+
+impl std::fmt::Debug for Wake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Wake")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexKind {
@@ -203,7 +231,7 @@ impl TexturePool {
 pub fn texture_pool(
     library: Arc<Library>,
     events: Sender<AppEvent>,
-    proxy: EventLoopProxy<()>,
+    wake: Wake,
     workers: usize,
 ) -> TexturePool {
     let shared = Arc::new(Shared {
@@ -217,7 +245,7 @@ pub fn texture_pool(
         let library = Arc::clone(&library);
         let events = events.clone();
         let shared = Arc::clone(&shared);
-        let proxy = proxy.clone();
+        let wake = wake.clone();
         std::thread::Builder::new()
             .name("forbiddenlibrary-preview".into())
             .spawn(move || {
@@ -253,7 +281,7 @@ pub fn texture_pool(
                             result,
                         });
                     }
-                    let _ = proxy.send_event(());
+                    wake.wake();
                 }
             })
             .ok();
@@ -270,7 +298,7 @@ pub fn start_import(
     cancel: Arc<AtomicBool>,
     optimize: Option<OptimizeConfig>,
     events: Sender<AppEvent>,
-    proxy: EventLoopProxy<()>,
+    wake: Wake,
     staging: Option<Arc<tempfile::TempDir>>,
 ) {
     std::thread::Builder::new()
@@ -284,11 +312,11 @@ pub fn start_import(
             };
             let mut emit = |event: ImportEvent| {
                 let _ = events.send(AppEvent::Import(event));
-                let _ = proxy.send_event(());
+                wake.wake();
             };
             let report = import_paths(&library, &paths, &options, &mut emit);
             let _ = events.send(AppEvent::ImportDone(report));
-            let _ = proxy.send_event(());
+            wake.wake();
         })
         .ok();
 }
@@ -298,7 +326,7 @@ pub fn start_discard(
     library: Arc<Library>,
     ids: Vec<String>,
     events: Sender<AppEvent>,
-    proxy: EventLoopProxy<()>,
+    wake: Wake,
 ) {
     std::thread::Builder::new()
         .name("forbiddenlibrary-discard".into())
@@ -308,7 +336,7 @@ pub fn start_discard(
                 .map(|_| ())
                 .map_err(|error| error.to_string());
             let _ = events.send(AppEvent::ImportDiscarded(result));
-            let _ = proxy.send_event(());
+            wake.wake();
         })
         .ok();
 }

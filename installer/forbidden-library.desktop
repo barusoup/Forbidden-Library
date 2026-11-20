@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Forbidden Library
+GenericName=Photo and Video Library
+Comment=A local photo and video library with optional encryption and efficient file storage
+Exec=forbidden-library %F
+TryExec=forbidden-library
+Icon=forbidden-library
+Terminal=false
+StartupNotify=true
+StartupWMClass=forbidden-library
+Categories=Graphics;Photography;Utility;
+Keywords=photos;videos;library;archive;import;media;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/avif;image/heic;image/tiff;image/bmp;image/x-adobe-dng;image/x-canon-cr2;image/x-nikon-nef;image/x-sony-arw;video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mpeg;video/mp2t;video/3gpp;video/x-flv;audio/mpeg;audio/mp4;audio/flac;audio/x-wav;audio/ogg;audio/opus;

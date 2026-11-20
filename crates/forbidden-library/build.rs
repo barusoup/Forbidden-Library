@@ -3,7 +3,10 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=../../assets/icon/app-icon.ico");
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    // Only Windows executables carry a resource section. The crate is a
+    // Windows-only dependency, so the code that uses it must be gated too.
+    #[cfg(windows)]
+    {
         winresource::WindowsResource::new()
             .set_icon("../../assets/icon/app-icon.ico")
             .compile()

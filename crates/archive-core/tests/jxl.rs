@@ -11,26 +11,33 @@ use std::process::Command;
 use std::sync::Once;
 use tempfile::TempDir;
 
-/// Point the engine at the bundled JPEG XL tools for this process. The engine
-/// caches its discovery, so this must run before any test here discovers
-/// tools, and every test calls it first. Returns false when the tools are not
-/// present, and the caller skips.
+/// Whether JPEG XL encoding is available for this process. A development
+/// checkout that has downloaded the bundled tools points the engine at them;
+/// otherwise discovery finds `cjxl` and `djxl` beside the app or on `PATH`.
+/// The engine caches its discovery, so this must run before any test here
+/// discovers tools, and every test calls it first.
 fn jxl_tools_present() -> bool {
-    let dir = std::env::var_os("FORBIDDEN_LIBRARY_JXL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/jxl"));
-    if !dir.join("cjxl.exe").is_file() || !dir.join("djxl.exe").is_file() {
-        return false;
-    }
     static POINT: Once = Once::new();
     POINT.call_once(|| {
-        // SAFETY: set before this process starts any engine work, because every
-        // test calls this first and `Once` makes the others wait for it.
-        unsafe {
-            std::env::set_var("FORBIDDEN_LIBRARY_JXL_DIR", &dir);
+        let dir = std::env::var_os("FORBIDDEN_LIBRARY_JXL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/jxl"));
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        if dir.join(format!("cjxl{suffix}")).is_file()
+            && dir.join(format!("djxl{suffix}")).is_file()
+        {
+            // SAFETY: set before this process starts any engine work, because
+            // every test calls this first and `Once` makes the others wait.
+            unsafe {
+                std::env::set_var("FORBIDDEN_LIBRARY_JXL_DIR", &dir);
+            }
         }
     });
-    true
+    let tools = Tools::discover();
+    if !tools.has_jxl() {
+        eprintln!("skipping: cjxl and djxl were not found");
+    }
+    tools.has_jxl()
 }
 
 /// A photograph-like picture: smooth gradients with a little noise, so it
@@ -88,7 +95,6 @@ fn import_with(library: &Library, paths: &[PathBuf], optimize: bool) -> archive_
 #[test]
 fn a_jpeg_is_stored_as_jpeg_xl_and_rebuilds_byte_for_byte() {
     if !jxl_tools_present() {
-        eprintln!("skipping: assets/jxl is not present");
         return;
     }
     let temp = TempDir::new().unwrap();
@@ -140,7 +146,6 @@ fn a_jpeg_is_stored_as_jpeg_xl_and_rebuilds_byte_for_byte() {
 #[test]
 fn a_rotated_jpeg_is_shown_upright_once_after_optimization() {
     if !jxl_tools_present() {
-        eprintln!("skipping: assets/jxl is not present");
         return;
     }
     let temp = TempDir::new().unwrap();
@@ -175,7 +180,6 @@ fn a_rotated_jpeg_is_shown_upright_once_after_optimization() {
 #[test]
 fn an_optimized_png_shows_exactly_its_own_pixels() {
     if !jxl_tools_present() {
-        eprintln!("skipping: assets/jxl is not present");
         return;
     }
     let temp = TempDir::new().unwrap();

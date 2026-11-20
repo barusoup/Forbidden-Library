@@ -9,8 +9,11 @@
 //! Imported files are untrusted. Every call is therefore bounded: one
 //! decoding thread, an allocation ceiling, an input-format allowlist and a
 //! deadline after which the process tree is killed. On Windows the child is
-//! also placed in a job object with a memory and process-count limit, so a
-//! decoder that misbehaves cannot take the whole app with it.
+//! also placed in a job object with a memory and process-count limit; on Unix
+//! it becomes a process-group leader under rlimits on memory, core dumps and
+//! file size, so killing the call kills everything the tool started. Either
+//! way a decoder that misbehaves cannot take the whole app with it, and cannot
+//! outlive the call.
 
 use crate::error::{Error, Result};
 use std::io::Read;
@@ -35,6 +38,15 @@ const OUTPUT_CAP: u64 = 32 * 1024 * 1024;
 const STILL_HEADROOM: u64 = 8 * 1024 * 1024;
 /// 256 MiB of transient allocation per tool invocation.
 const MAX_ALLOC: &str = "268435456";
+/// On Linux, the anonymous memory a tool process may map. It is far above a
+/// real decode or transcode (FFmpeg's own ceiling is [`MAX_ALLOC`]) and exists
+/// so a decoder that runs away hits a wall instead of the machine's memory.
+#[cfg(target_os = "linux")]
+const TOOL_MEMORY: u64 = 2 * 1024 * 1024 * 1024;
+/// On Linux, the largest file a tool may write. A single transcode is never
+/// near it; a muxer looping over its input would be, and fills the disk.
+#[cfg(target_os = "linux")]
+const TOOL_FILE: u64 = 4 * 1024 * 1024 * 1024;
 /// The scaler used for every downscale. Lanczos with accurate rounding and
 /// full chroma interpolation keeps a decoded still close to its source; the
 /// default bicubic visibly softens fine detail.
@@ -135,14 +147,42 @@ fn locate(env: &str, folder: &str, name: &str) -> Option<PathBuf> {
         .or_else(|| path_tool(name))
 }
 
+/// The file name a bundled tool has. The Windows installer ships `ffmpeg.exe`
+/// and `cjxl.exe`; a Unix build ships the tools under their plain names, so
+/// searching for the Windows spelling there would find nothing.
+#[cfg(windows)]
+const TOOL_SUFFIX: &str = ".exe";
+#[cfg(not(windows))]
+const TOOL_SUFFIX: &str = "";
+
 fn find_tool(dir: &Path, name: &str) -> Option<PathBuf> {
-    for candidate in [format!("{name}.exe"), name.to_string()] {
+    // Windows takes an `.exe` first and then an extensionless copy, so a
+    // hand-placed build keeps working; Unix only ever looks for the plain
+    // name, because an `.exe` there is some unrelated file.
+    #[cfg(windows)]
+    let candidates = [format!("{name}{TOOL_SUFFIX}"), name.to_string()];
+    #[cfg(not(windows))]
+    let candidates = [format!("{name}{TOOL_SUFFIX}")];
+    candidates.iter().find_map(|candidate| {
         let path = dir.join(candidate);
-        if path.is_file() {
-            return Some(path.canonicalize().unwrap_or(path));
-        }
+        executable(&path).then(|| path.canonicalize().unwrap_or(path))
+    })
+}
+
+/// Whether `path` is a file this platform can run. On Unix the execute bit is
+/// what makes a file a program: a stray document named `ffmpeg` beside the app
+/// or on `PATH` must not be mistaken for one.
+fn executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
     }
-    None
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// A bare executable on `PATH` is accepted only from an absolute directory:
@@ -163,6 +203,9 @@ fn path_tool(name: &str) -> Option<PathBuf> {
 
 /// A command that never flashes a console window.
 pub fn command(program: &Path) -> Command {
+    // Only Windows changes the command here; Unix containment is applied by
+    // the spawn sites, which have to reason about when the child is reaped.
+    #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
@@ -173,6 +216,56 @@ pub fn command(program: &Path) -> Command {
     cmd
 }
 
+/// Put a tool in its own process group, and on Linux under the resource
+/// ceilings a decoder must not cross.
+///
+/// On Unix the process group is what makes the child tree killable: a signal
+/// to the negated group reaches FFmpeg and every helper it started, which a
+/// signal to the child alone would leave running. The rlimits are backstops,
+/// not budgets: a real transcode stays far below them, so only a decoder that
+/// has run away ever hits one. They are set between fork and exec, where only
+/// async-signal-safe calls are allowed, and a `setrlimit` failure is ignored so
+/// a host with a lower hard limit still runs the tool.
+#[cfg(unix)]
+fn contain(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    // SAFETY: the closure allocates nothing and only calls getrlimit and
+    // setrlimit, both of which are async-signal-safe.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        cmd.pre_exec(|| {
+            cap(libc::RLIMIT_CORE, 0);
+            cap(libc::RLIMIT_DATA, TOOL_MEMORY);
+            cap(libc::RLIMIT_FSIZE, TOOL_FILE);
+            Ok(())
+        });
+    }
+}
+
+/// Lower one rlimit's soft limit, never raising it. Failure is not an error:
+/// the containment is a backstop, and a host that forbids the limit must still
+/// be able to run the tool.
+#[cfg(target_os = "linux")]
+fn cap(resource: libc::__rlimit_resource_t, value: u64) {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: both calls only read and write this process's own limits, and
+    // `limits` is initialized before it is passed.
+    unsafe {
+        if libc::getrlimit(resource, &mut limits) != 0 {
+            return;
+        }
+        if limits.rlim_cur != libc::RLIM_INFINITY && limits.rlim_cur <= value {
+            return;
+        }
+        limits.rlim_cur = value.min(limits.rlim_max);
+        libc::setrlimit(resource, &limits);
+    }
+}
+
 /// What a bounded tool run produced.
 pub struct Bounded {
     pub status: std::process::ExitStatus,
@@ -181,13 +274,15 @@ pub struct Bounded {
     pub timed_out: bool,
 }
 
-/// Run a media tool with a deadline, bounded output and, on Windows, a job
-/// object around its process tree. The child never gets a console, stdin, or
-/// the ability to outlive this call.
+/// Run a media tool with a deadline, bounded output and a job object (Windows)
+/// or process group (Unix) around its process tree. The child never gets a
+/// console, stdin, or the ability to outlive this call.
 pub(crate) fn run_bounded(mut cmd: Command, deadline: Duration) -> std::io::Result<Bounded> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    contain(&mut cmd);
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
     let _containment = match job::attach(&child) {
@@ -198,16 +293,25 @@ pub(crate) fn run_bounded(mut cmd: Command, deadline: Duration) -> std::io::Resu
             return Err(error);
         }
     };
+    #[cfg(unix)]
+    let mut containment = group::Containment::attach(&child);
     let stdout = child.stdout.take().map(|pipe| drain(pipe, STDOUT_CAP));
     let stderr = child.stderr.take().map(|pipe| drain(pipe, STDERR_CAP));
     let started = Instant::now();
     let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
+            // Waiting reaps the child, which frees its process-group id for
+            // the kernel to hand to something else. The tool finished on its
+            // own and closed its pipes, so containment ends here.
+            #[cfg(unix)]
+            containment.disarm();
             break status;
         }
         if started.elapsed() >= deadline {
             timed_out = true;
+            #[cfg(unix)]
+            containment.kill();
             let _ = child.kill();
             break child.wait()?;
         }
@@ -534,6 +638,8 @@ pub struct Stream {
     stderr: Arc<Mutex<Vec<u8>>>,
     #[cfg(windows)]
     _job: job::Containment,
+    #[cfg(unix)]
+    group: group::Containment,
 }
 
 impl Stream {
@@ -555,12 +661,23 @@ impl Stream {
 
     /// The exit status once the tool has finished, without waiting for it.
     pub fn try_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        let status = self.child.try_wait().ok().flatten();
+        #[cfg(unix)]
+        if status.is_some() {
+            // Waiting reaps the tool and frees its process-group id for reuse,
+            // so the group must not be signalled after this point.
+            self.group.disarm();
+        }
+        status
     }
 }
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        // The group goes first: the tool is still unreaped, so its group id
+        // cannot have been recycled, and anything it started dies with it.
+        #[cfg(unix)]
+        self.group.kill();
         // The tool may already have exited; neither call failing matters.
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -573,6 +690,8 @@ fn spawn_stream(mut cmd: Command) -> Result<Stream> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    contain(&mut cmd);
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
     let job = match job::attach(&child) {
@@ -583,6 +702,8 @@ fn spawn_stream(mut cmd: Command) -> Result<Stream> {
             return Err(error.into());
         }
     };
+    #[cfg(unix)]
+    let group = group::Containment::attach(&child);
     let stderr = Arc::new(Mutex::new(Vec::new()));
     if let Some(pipe) = child.stderr.take() {
         // Diagnostics are only ever shown on failure, so they are kept in a
@@ -596,6 +717,8 @@ fn spawn_stream(mut cmd: Command) -> Result<Stream> {
         stderr,
         #[cfg(windows)]
         _job: job,
+        #[cfg(unix)]
+        group,
     })
 }
 
@@ -782,6 +905,61 @@ mod job {
     }
 }
 
+/// Unix process-group containment for a media tool and anything it starts.
+///
+/// The tool is spawned as its own process-group leader (see [`contain`]), so
+/// one signal to the negated group reaches every process it started. The group
+/// is signalled only while the direct child is still unreaped: waiting for it
+/// frees the group id for the kernel to reuse, and a signal to a recycled id
+/// could hit an unrelated process. A tool that exits on its own has closed its
+/// pipes by then, which is what makes the wait safe.
+#[cfg(unix)]
+mod group {
+    use std::process::Child;
+
+    pub struct Containment {
+        pgid: libc::pid_t,
+        armed: bool,
+    }
+
+    impl Containment {
+        /// Track the child's process group. [`contain`] made the child a
+        /// group leader, so its own pid is the group id.
+        pub fn attach(child: &Child) -> Self {
+            Self {
+                pgid: child.id() as libc::pid_t,
+                armed: true,
+            }
+        }
+
+        /// SIGKILL the whole group. See the module comment for when this is
+        /// safe to call.
+        pub fn kill(&mut self) {
+            if !self.armed {
+                return;
+            }
+            self.armed = false;
+            // SAFETY: a negated pid means "this process group", and SIGKILL
+            // needs no handler. A group that has already emptied gives ESRCH,
+            // which is the outcome wanted anyway.
+            unsafe {
+                libc::kill(-self.pgid, libc::SIGKILL);
+            }
+        }
+
+        /// Stop tracking the group because the child has been reaped.
+        pub fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for Containment {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,13 +987,93 @@ mod tests {
         assert!(both.has_jxl());
     }
 
+    /// Write a file `find_tool` should accept: the platform's own name
+    /// spelling, and on Unix an execute bit.
+    fn write_tool(dir: &Path, name: &str) {
+        let path = dir.join(format!("{name}{TOOL_SUFFIX}"));
+        std::fs::write(&path, b"tool").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     #[test]
     fn a_bundled_tool_is_found_by_name_in_its_folder() {
         let temp = tempfile::tempdir().unwrap();
         assert!(find_tool(temp.path(), "cjxl").is_none());
-        std::fs::write(temp.path().join("cjxl.exe"), b"encoder").unwrap();
+        write_tool(temp.path(), "cjxl");
         let found = find_tool(temp.path(), "cjxl").unwrap();
-        assert_eq!(found.file_name().unwrap(), "cjxl.exe");
+        assert_eq!(
+            found.file_name().unwrap(),
+            format!("cjxl{TOOL_SUFFIX}").as_str()
+        );
+    }
+
+    /// The Windows spelling must not be picked up on Unix, where a bundled
+    /// tool has no extension and `cjxl.exe` would be some unrelated file.
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_must_be_executable_and_use_the_platform_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cjxl");
+        std::fs::write(&path, b"encoder").unwrap();
+        assert!(
+            find_tool(temp.path(), "cjxl").is_none(),
+            "a file without an execute bit is not a tool"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            find_tool(temp.path(), "cjxl").unwrap(),
+            path.canonicalize().unwrap()
+        );
+
+        let windows_spelling = temp.path().join("djxl.exe");
+        std::fs::write(&windows_spelling, b"encoder").unwrap();
+        std::fs::set_permissions(&windows_spelling, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert!(find_tool(temp.path(), "djxl").is_none());
+    }
+
+    /// A tool that forks must not outlive the call that started it. `sh`
+    /// starts a background sleep and then a foreground one, so killing only
+    /// the direct child would leave the background one running for minutes.
+    #[cfg(unix)]
+    #[test]
+    fn a_deadline_kills_the_tools_whole_process_group() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pgid");
+        let mut cmd = command(Path::new("sh"));
+        cmd.arg("-c").arg(format!(
+            "echo $$ > '{}'; sleep 300 & sleep 300",
+            pid_file.display()
+        ));
+        let run = run_bounded(cmd, Duration::from_millis(500)).unwrap();
+        assert!(run.timed_out, "the tool should have hit its deadline");
+        let pgid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        // `run_bounded` makes the tool a group leader, so the shell's own pid
+        // (what `$$` reports) is the group id. SIGKILL reached the whole group;
+        // the reaping of the orphaned sleeps happens outside this process.
+        let group_is_gone = || {
+            // SAFETY: signal 0 only asks whether the group still has members.
+            unsafe { libc::kill(-pgid, 0) == -1 }
+        };
+        for _ in 0..200 {
+            if group_is_gone() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("process group {pgid} outlived the bounded run");
     }
 
     const FULL_STILL_SIDE: u32 = 8192;

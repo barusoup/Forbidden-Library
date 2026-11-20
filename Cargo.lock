@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "archive-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -146,6 +146,7 @@ dependencies = [
  "image",
  "jxl-oxide",
  "kamadak-exif",
+ "libc",
  "oxipng",
  "rusqlite",
  "serde",
@@ -1228,7 +1229,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 [[package]]
 name = "dream"
 version = "0.1.0"
-source = "git+https://github.com/barusoup/Dream?rev=e980dd7d9d1119a9a54efc0187124d3e556faaec#e980dd7d9d1119a9a54efc0187124d3e556faaec"
+source = "git+https://github.com/barusoup/Dream?rev=582b4e2a5f5900a36b15e323457eb41620fd1379#582b4e2a5f5900a36b15e323457eb41620fd1379"
 dependencies = [
  "ash",
  "ash-window",
@@ -1241,7 +1242,6 @@ dependencies = [
  "gpu-allocator",
  "image",
  "naga",
- "objc",
  "objc2 0.6.5",
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "forbidden-library"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "archive-core",
  "axum",

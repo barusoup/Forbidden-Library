@@ -3,12 +3,16 @@
 //! The app ships EmbeddingGemma 2 (GGUF) and a llama.cpp runtime. On first
 //! use a private `llama-server` is started, preferring the Vulkan build (so
 //! the GPU is used when one is available) and falling back to the CPU build.
-//! Every imported preview is embedded once and stored in the catalogue; a
-//! typed query is embedded into the same space and ranked by cosine
-//! similarity. None of this is surfaced in the UI, and the server is shut
-//! down with the app.
+//! On Windows the runtime folder holds the server `.exe` and its DLLs; on
+//! Linux it holds a `llama-server` binary next to shared libraries
+//! (`libllama.so`, `libggml*.so`, `libmtmd.so`, ...), so the server is started
+//! with `LD_LIBRARY_PATH` pointing at its own folder and in its own process
+//! group, which lets the app take down everything it spawned. Every imported
+//! preview is embedded once and stored in the catalogue; a typed query is
+//! embedded into the same space and ranked by cosine similarity. None of this
+//! is surfaced in the UI, and the server is shut down with the app.
 
-use crate::worker::AppEvent;
+use crate::worker::{AppEvent, Wake};
 use archive_core::{EMBED_DIMS, EMBED_MODEL, Item, Library, VectorIndex, prepare};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -24,7 +28,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use winit::event_loop::EventLoopProxy;
 
 /// The model card's retrieval prefix. Images are embedded without it.
 const QUERY_PREFIX: &str = "task: search result | query: ";
@@ -43,6 +46,12 @@ const QUERY_CACHE: usize = 8;
 const SCAN_EVERY: Duration = Duration::from_secs(5);
 const MODEL_FILE: &str = "model/embeddinggemma-2-UD-Q4_K_XL.gguf";
 const MMPROJ_FILE: &str = "model/mmproj-Q8_0.gguf";
+/// llama.cpp ships the server as `llama-server.exe` on Windows and as a plain
+/// `llama-server` elsewhere.
+#[cfg(windows)]
+const SERVER_EXE: &str = "llama-server.exe";
+#[cfg(not(windows))]
+const SERVER_EXE: &str = "llama-server";
 
 enum Job {
     Wake,
@@ -63,13 +72,13 @@ impl Semantic {
     pub fn start(
         library: Arc<Library>,
         events: Sender<AppEvent>,
-        proxy: Option<EventLoopProxy<()>>,
+        wake: Option<Wake>,
     ) -> Option<Self> {
         let assets = Assets::discover(library.paths().logs())?;
         let (sender, receiver) = channel();
         let thread = std::thread::Builder::new()
             .name("forbiddenlibrary-search".into())
-            .spawn(move || run(assets, library, events, proxy, receiver))
+            .spawn(move || run(assets, library, events, wake, receiver))
             .ok()?;
         Some(Self {
             sender,
@@ -142,7 +151,7 @@ impl Assets {
             }
             let mut runtimes = Vec::new();
             for (folder, gpu) in [("runtime/vulkan", true), ("runtime/cpu", false)] {
-                let exe = base.join(folder).join("llama-server.exe");
+                let exe = base.join(folder).join(SERVER_EXE);
                 if exe.is_file() {
                     runtimes.push(Runtime { exe, gpu });
                 }
@@ -166,11 +175,18 @@ struct Server {
     port: u16,
     key: String,
     agent: ureq::Agent,
+    /// Kill-on-close job object; Windows only, see [`attach_job`].
+    #[cfg(windows)]
     job: Option<isize>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // The server leads its own process group on Linux (see [`Server::launch`]),
+        // so signal the whole group. Killing only the parent would leave the
+        // workers and anything else it forked behind.
+        #[cfg(unix)]
+        kill_group(self.child.id());
         let _ = self.child.kill();
         let _ = self.child.wait();
         #[cfg(windows)]
@@ -179,6 +195,22 @@ impl Drop for Server {
                 windows_sys::Win32::Foundation::CloseHandle(job as *mut _);
             }
         }
+    }
+}
+
+/// `kill(2)` the process group led by `pid`. The child is started with
+/// `process_group(0)`, so its pid is also its process group id. One call is
+/// all this crate needs from libc, so it is declared here instead of adding a
+/// dependency for it.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: `kill` is the POSIX signal call with plain integer arguments;
+    // the arguments are built here and a failed call is deliberately ignored.
+    unsafe {
+        kill(-(pid as i32), 9);
     }
 }
 
@@ -214,11 +246,6 @@ fn attach_job(child: &Child) -> Option<isize> {
             None
         }
     }
-}
-
-#[cfg(not(windows))]
-fn attach_job(_child: &Child) -> Option<isize> {
-    None
 }
 
 impl Server {
@@ -290,7 +317,27 @@ impl Server {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // The Linux runtime is a folder of shared libraries beside the
+            // server binary, so point the loader at that folder and keep any
+            // path the user already configured.
+            if let Some(dir) = runtime.exe.parent() {
+                let mut paths = vec![dir.to_path_buf()];
+                if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+                    paths.extend(std::env::split_paths(&existing));
+                }
+                let value =
+                    std::env::join_paths(paths).unwrap_or_else(|_| dir.as_os_str().to_owned());
+                command.env("LD_LIBRARY_PATH", value);
+            }
+            // Own process group, so Drop can take the server and everything
+            // it spawned down together.
+            command.process_group(0);
+        }
         let mut child = command.spawn().map_err(|error| format!("spawn: {error}"))?;
+        #[cfg(windows)]
         let job = attach_job(&child);
         let agent: ureq::Agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(2))
@@ -312,6 +359,7 @@ impl Server {
                     port,
                     key,
                     agent,
+                    #[cfg(windows)]
                     job,
                 });
             }
@@ -496,7 +544,7 @@ fn run(
     assets: Assets,
     library: Arc<Library>,
     events: Sender<AppEvent>,
-    proxy: Option<EventLoopProxy<()>>,
+    wake: Option<Wake>,
     commands: Receiver<Job>,
 ) {
     // Load the stored vectors straight into the index's layout: with a large
@@ -521,7 +569,7 @@ fn run(
             Ok(Job::Query { seq, text }) => {
                 let ids = search.answer(&text, &index, &assets);
                 let _ = events.send(AppEvent::SemanticResults { seq, ids });
-                wake(&proxy);
+                wake_ui(&wake);
             }
             Err(TryRecvError::Empty) => {}
         }
@@ -546,7 +594,7 @@ fn run(
                 Ok(Job::Query { seq, text }) => {
                     let ids = search.answer(&text, &index, &assets);
                     let _ = events.send(AppEvent::SemanticResults { seq, ids });
-                    wake(&proxy);
+                    wake_ui(&wake);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -563,7 +611,7 @@ fn run(
                 Ok(Job::Query { seq, text }) => {
                     let ids = search.answer(&text, &index, &assets);
                     let _ = events.send(AppEvent::SemanticResults { seq, ids });
-                    wake(&proxy);
+                    wake_ui(&wake);
                 }
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -582,13 +630,13 @@ fn run(
         if last_notice.elapsed() >= Duration::from_secs(1) {
             last_notice = Instant::now();
             let _ = events.send(AppEvent::SemanticAdvanced);
-            wake(&proxy);
+            wake_ui(&wake);
         }
         if queue.is_empty() {
             // Keep going immediately if more media is already waiting.
             next_scan = Instant::now();
             let _ = events.send(AppEvent::SemanticAdvanced);
-            wake(&proxy);
+            wake_ui(&wake);
         }
     }
 
@@ -658,9 +706,9 @@ fn index_batch(
     true
 }
 
-fn wake(proxy: &Option<EventLoopProxy<()>>) {
-    if let Some(proxy) = proxy {
-        let _ = proxy.send_event(());
+fn wake_ui(wake: &Option<Wake>) {
+    if let Some(wake) = wake {
+        wake.wake();
     }
 }
 

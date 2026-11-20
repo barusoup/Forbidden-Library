@@ -35,7 +35,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 cpal = "0.16"
 dirs = "6"
 getrandom = "0.3"
-dream = { git = "https://github.com/barusoup/Dream", rev = "e980dd7d9d1119a9a54efc0187124d3e556faaec" }
+dream = { git = "https://github.com/barusoup/Dream", rev = "582b4e2a5f5900a36b15e323457eb41620fd1379" }
 raw-window-handle = "0.6"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
@@ -56,6 +56,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["gif", "png"] }

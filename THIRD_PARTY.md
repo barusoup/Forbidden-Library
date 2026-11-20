@@ -2,30 +2,43 @@
 
 ## FFmpeg
 
-The installer carries a Windows build of FFmpeg (the "essentials" build from
-gyan.dev) as two separate executables, `ffmpeg.exe` and `ffprobe.exe`, in
-`ffmpeg`. The app runs them as subprocesses for probing containers and
-generating video and uncommon-image previews. FFmpeg is not linked into the app.
+The installer carries FFmpeg as two separate executables, `ffmpeg` and
+`ffprobe`, in `ffmpeg`. The app runs them as subprocesses for probing
+containers and generating video and uncommon-image previews. FFmpeg is not
+linked into the app.
+
+- Windows: the "essentials" build from gyan.dev
+  (<https://www.gyan.dev/ffmpeg/builds/>), as `ffmpeg.exe` and `ffprobe.exe`.
+- Linux: the static FFmpeg 7.0.2 amd64 build from johnvansickle.com
+  (<https://johnvansickle.com/ffmpeg/>), as `ffmpeg` and `ffprobe`.
 
 FFmpeg is licensed under the GNU General Public License, version 3 or later,
 with portions under the GNU Lesser General Public License. The full licence
-text that ships with the build is copied to `ffmpeg\LICENSE.txt` in the
-installed payload and in `assets/ffmpeg/LICENSE.txt` in this repository.
+text that ships with the build is copied to `ffmpeg/LICENSE.txt` in the
+installed payload. For the Windows build the same text is kept in
+`assets/ffmpeg/LICENSE.txt` in this repository.
 
-Source and build information: <https://ffmpeg.org/> and
-<https://www.gyan.dev/ffmpeg/builds/>.
+Source and build information: <https://ffmpeg.org/>,
+<https://www.gyan.dev/ffmpeg/builds/> and
+<https://johnvansickle.com/ffmpeg/>.
 
 ## libjxl
 
-The JPEG XL command-line tools `cjxl.exe` and `djxl.exe` (libjxl v0.12.0) are
-bundled in `jxl` beside the app. The app runs them as subprocesses to
-transcode JPEGs losslessly, to encode lossless PNGs and to rebuild a JPEG from
-its JPEG XL form. libjxl is not linked into the app.
+The JPEG XL command-line tools `cjxl` and `djxl` (libjxl v0.12.0) are bundled
+in `jxl` beside the app. The app runs them as subprocesses to transcode JPEGs
+losslessly, to encode lossless PNGs and to rebuild a JPEG from its JPEG XL
+form. libjxl is not linked into the app.
+
+- Windows: `cjxl.exe` and `djxl.exe` from the static Windows build
+  (`jxl-x64-windows-static.zip`).
+- Linux: `cjxl` and `djxl` from the static Linux build
+  (`jxl-linux-x86_64-static.tar.lz`). That build links several libraries
+  statically, so the licences it ships are copied into `jxl/` as well.
 
 libjxl is licensed under the BSD 3-Clause License. Copyright (c) the JPEG XL
 Project Authors. The licence text that ships with the tools is copied to
-`jxl/LICENSE.txt` in the installed payload and in `assets/jxl/LICENSE.txt` in
-this repository.
+`jxl/LICENSE.txt` in the installed payload too (for the Windows build it is
+also kept in `assets/jxl/LICENSE.txt` in this repository).
 
 Source and release: <https://github.com/libjxl/libjxl/releases/tag/v0.12.0>.
 
@@ -44,6 +57,13 @@ Semantic search runs the EmbeddingGemma model (GGUF conversion from
 MIT License). Both are bundled in `semantic` and run locally as a subprocess.
 The model is provided under the Gemma Terms of Use,
 <https://ai.google.dev/gemma/terms>.
+
+llama.cpp release b11846 ships the runtime for each platform: on Windows
+`llama-server.exe` and its DLLs under `semantic\runtime\{vulkan,cpu}`, and on
+Linux `llama-server` with its shared libraries (`libllama*.so`, `libggml*.so`,
+`libmtmd.so`, ...) in the same folders. The Vulkan build is preferred and the
+CPU build is the fallback. The MIT licence text from the release is kept beside
+each runtime.
 
 ## Roboto
 

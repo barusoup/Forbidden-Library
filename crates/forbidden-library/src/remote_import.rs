@@ -130,7 +130,73 @@ fn physical_lan_interfaces() -> Vec<String> {
     }
 }
 
-#[cfg(not(windows))]
+/// The Linux equivalent, read from `/sys/class/net` like `ip link` does. A
+/// real adapter has a `device` symlink (it hangs off a bus), an ARPHRD type of
+/// 1 (Ethernet) or 801 (mac80211 Wi-Fi) and is operationally up. Bridges, veth
+/// pairs, VPN and container interfaces fail at least one of those. If a
+/// machine only shows nameless fallbacks, the up Ethernet/Wi-Fi interfaces are
+/// returned instead, so the caller still has something to rank.
+#[cfg(target_os = "linux")]
+fn physical_lan_interfaces() -> Vec<String> {
+    use std::fs;
+    const SKIP: &[&str] = &[
+        "lo",
+        "docker",
+        "veth",
+        "br-",
+        "virbr",
+        "tun",
+        "tap",
+        "wg",
+        "zt",
+        "tailscale",
+        "cni",
+        "flannel",
+    ];
+    let Ok(entries) = fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut hardware = Vec::new();
+    let mut fallback = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        if SKIP
+            .iter()
+            .any(|skip| lower == *skip || lower.starts_with(skip))
+        {
+            continue;
+        }
+        let dir = entry.path();
+        let up = fs::read_to_string(dir.join("operstate")).is_ok_and(|state| state.trim() == "up");
+        if !up {
+            continue;
+        }
+        // 1 = ARPHRD_ETHER, 801 = ARPHRD_IEEE80211. Anything else (loopback,
+        // tunnels, packet sockets) is not a LAN adapter.
+        let kind = fs::read_to_string(dir.join("type"))
+            .ok()
+            .and_then(|kind| kind.trim().parse::<u32>().ok());
+        if kind.is_some_and(|kind| !matches!(kind, 1 | 801)) {
+            continue;
+        }
+        // Hardware adapters hang a `device` symlink in their sysfs directory;
+        // bridges and virtual links do not.
+        if dir.join("device").exists() || kind == Some(801) {
+            hardware.push(name);
+        } else {
+            fallback.push(name);
+        }
+    }
+    hardware.sort_unstable();
+    if !hardware.is_empty() {
+        return hardware;
+    }
+    fallback.sort_unstable();
+    fallback
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn physical_lan_interfaces() -> Vec<String> {
     Vec::new()
 }
@@ -787,6 +853,23 @@ mod tests {
         assert!(matches!(session.status(), Status::Closed(_)));
         assert!(!session.staging.path().exists());
         assert!(std::net::TcpStream::connect(&session.address).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_interface_scan_skips_loopback_and_virtual_links() {
+        let interfaces = physical_lan_interfaces();
+        for name in &interfaces {
+            assert_ne!(name, "lo");
+            assert!(!name.starts_with("veth"));
+            assert!(!name.starts_with("docker"));
+            assert!(!name.starts_with("br-"));
+            // Everything reported is a live sysfs entry that is up.
+            let state = std::fs::read_to_string(format!("/sys/class/net/{name}/operstate"));
+            assert_eq!(state.ok().as_deref().map(str::trim), Some("up"), "{name}");
+        }
+        // The scan feeds the selector directly, so it must accept it as-is.
+        let _ = select_lan_address(None, Vec::new(), &interfaces);
     }
 
     #[test]

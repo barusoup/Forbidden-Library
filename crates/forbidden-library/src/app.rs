@@ -2,6 +2,7 @@
 //! top of BedFrame's draw list; the archive engine is only ever reached
 //! through background workers (except for tiny catalogue reads).
 
+use crate::autolock::{AutoLock, VAULT_IDLE};
 use crate::details;
 use crate::grid::{self, GridLayout, HEADER_H, TILE_TARGET};
 #[cfg(not(feature = "plain-controls"))]
@@ -24,10 +25,7 @@ use crate::viewer::{
     controls_wanted, ease_view, fraction_along, image_rect, is_double_click, max_zoom, pan,
     zoom_at,
 };
-use crate::worker::{
-    self, AppEvent, AppLockDone, AppLockKind, AppLockReply, TexKind, TextureJob, TexturePool,
-    VaultDone, VaultKind,
-};
+use crate::worker::{self, AppEvent, TexKind, TextureJob, TexturePool, VaultDone, VaultKind};
 use archive_core::{
     Album, AudioMeta, COVER_LAYERS, Collection, ImportEvent, ImportReport, Item, Kind, Library,
     LockState, LyricLine, MIN_PASSWORD_CHARS, OptimizeConfig, PageCursor, Stats, ThumbState,
@@ -42,7 +40,7 @@ use dream::ui::draw::UiFrame;
 use dream::ui::font::Align;
 use dream::ui::theme::Theme;
 use dream::ui::tokens::{Elevation, FontWeight};
-use dream::ui::widgets::{LabelStyle, Ui, UiInput};
+use dream::ui::widgets::{LabelStyle, Ui, UiCursor, UiInput};
 use dream::ui::{Color, Rect};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -50,7 +48,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
-use winit::event_loop::EventLoopProxy;
 use winit::window::Window;
 use zeroize::Zeroize;
 
@@ -127,7 +124,6 @@ enum EmptyKind {
 
 /// Idle time after which every unlocked collection locks itself. Input inside
 /// the window resets it; looking at a picture inside a collection holds it off.
-const VAULT_IDLE: Duration = Duration::from_secs(60);
 /// One caret blink cycle of the search field, in seconds, and how long of it
 /// the caret is shown.
 const CARET_PERIOD: f32 = 1.06;
@@ -973,6 +969,9 @@ pub struct ArchiveApp {
     /// A lock, unlock or seal is running on a background thread. Vault actions
     /// wait for it, so two never race over the same collection.
     vault_busy: bool,
+    /// Seals unlocked collections when the library goes idle, even while the
+    /// window is hidden and draws no frames. See [`AutoLock`].
+    auto_lock: Option<AutoLock>,
     /// The thread running the current vault job. Joined on exit, so a seal
     /// in progress finishes before the process ends.
     vault_thread: Option<std::thread::JoinHandle<()>>,
@@ -1059,23 +1058,27 @@ pub struct ArchiveApp {
 
     events_tx: Sender<AppEvent>,
     events_rx: Receiver<AppEvent>,
-    proxy: Option<EventLoopProxy<()>>,
+    /// Wakes the frame loop from background threads.
+    proxy: Option<worker::Wake>,
     pub cursor_hand: bool,
     pub last_error: Option<String>,
 }
 
 impl ArchiveApp {
-    pub fn new(window: Arc<Window>, proxy: EventLoopProxy<()>) -> Result<Self, String> {
+    /// The app in the window the render-check harness owns. The harness builds
+    /// the renderer and the UI itself and drives [`Self::render`] in a loop; the
+    /// shipped app goes through [`Self::attached`] instead.
+    pub fn new(window: Arc<Window>, wake: worker::Wake) -> Result<Self, String> {
         let settings = Settings::load();
+        let root = settings.library_root();
         let system_dark = window.theme() == Some(winit::window::Theme::Dark);
-        let library =
-            Arc::new(Library::open(settings.library_root()).map_err(|error| error.to_string())?);
-        let dark = match settings.theme {
-            ThemeChoice::System => system_dark,
-            ThemeChoice::Light => false,
-            ThemeChoice::Dark => true,
-        };
-        let theme = archive_theme(dark);
+        let scale = window.scale_factor() as f32;
+        let physical = window.inner_size();
+        let screen = (
+            physical.width as f32 / scale.max(1.0),
+            physical.height as f32 / scale.max(1.0),
+        );
+        let theme = archive_theme(Self::initial_dark(&settings, system_dark));
         let mut ui = Ui::new(
             crate::fonts::roboto(),
             dream::ui::atlas::AtlasConfig::default(),
@@ -1091,24 +1094,125 @@ impl ArchiveApp {
             },
         );
         let context = Some(Arc::clone(renderer.context()));
-        let scale = window.scale_factor() as f32;
-        let physical = window.inner_size();
-        let screen = (
-            physical.width as f32 / scale.max(1.0),
-            physical.height as f32 / scale.max(1.0),
+        Self::assemble(
+            settings,
+            root,
+            system_dark,
+            screen,
+            scale,
+            Some(ui),
+            Some(renderer),
+            context,
+            Some(wake),
+            true,
+        )
+    }
+
+    /// The app under Dream's app runner. The runner owns the window, the
+    /// renderer and the UI and hands them back once per frame; the app only
+    /// fills that frame (see [`Self::runner_frame`]) and says whether it wants
+    /// another.
+    pub fn attached(
+        dark: bool,
+        context: Arc<GpuContext>,
+        wake: worker::Wake,
+        scale: f32,
+        screen: (f32, f32),
+    ) -> Result<Self, String> {
+        let settings = Settings::load();
+        let root = settings.library_root();
+        Self::assemble(
+            settings,
+            root,
+            dark,
+            screen,
+            scale,
+            None,
+            None,
+            Some(context),
+            Some(wake),
+            true,
+        )
+    }
+
+    /// A renderer-free instance used by layout tests and the selfcheck's
+    /// first phase. No worker threads are started.
+    pub fn headless(root: PathBuf, settings: Settings) -> Result<Self, String> {
+        let theme = archive_theme(Self::initial_dark(&settings, false));
+        let mut ui = Ui::new(
+            crate::fonts::roboto(),
+            dream::ui::atlas::AtlasConfig::default(),
         );
+        ui.set_theme(&theme);
+        let mut app = Self::assemble(
+            settings,
+            root,
+            false,
+            (1440.0, 900.0),
+            1.0,
+            Some(ui),
+            None,
+            None,
+            None,
+            false,
+        )?;
+        app.reload();
+        Ok(app)
+    }
+
+    /// Which palette the settings ask for, given the OS's own appearance.
+    fn initial_dark(settings: &Settings, system_dark: bool) -> bool {
+        match settings.theme {
+            ThemeChoice::System => system_dark,
+            ThemeChoice::Light => false,
+            ThemeChoice::Dark => true,
+        }
+    }
+
+    /// Puts the app together for every entry point. Only the harness passes a
+    /// renderer and a UI (it drives them itself); the runner passes just the
+    /// GPU context and its wake handle. `workers` is off for headless tests,
+    /// which start no threads.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        settings: Settings,
+        root: PathBuf,
+        system_dark: bool,
+        screen: (f32, f32),
+        scale: f32,
+        ui: Option<Ui>,
+        renderer: Option<Renderer>,
+        context: Option<Arc<GpuContext>>,
+        wake: Option<worker::Wake>,
+        workers: bool,
+    ) -> Result<Self, String> {
+        let dark = Self::initial_dark(&settings, system_dark);
+        let theme = archive_theme(dark);
+        let library = Arc::new(Library::open(root).map_err(|error| error.to_string())?);
         let (events_tx, events_rx) = mpsc::channel();
-        let texture_pool = Some(worker::texture_pool(
-            Arc::clone(&library),
-            events_tx.clone(),
-            proxy.clone(),
-            4,
-        ));
+        let texture_pool = if workers {
+            wake.as_ref().and_then(|wake| {
+                Some(worker::texture_pool(
+                    Arc::clone(&library),
+                    events_tx.clone(),
+                    wake.clone(),
+                    4,
+                ))
+            })
+        } else {
+            None
+        };
+        let auto_lock = if workers {
+            wake.as_ref()
+                .map(|wake| AutoLock::start(Arc::clone(&library), events_tx.clone(), wake.clone()))
+        } else {
+            None
+        };
         let gate = AppGate::for_library(&library);
         let mut app = Self {
-            renderer: Some(renderer),
+            renderer,
             context,
-            ui: Some(ui),
+            ui,
             theme,
             dark,
             system_dark,
@@ -1171,6 +1275,7 @@ impl ArchiveApp {
             modal_t: 0.0,
             last_activity: Instant::now(),
             vault_busy: false,
+            auto_lock,
             vault_thread: None,
             sheet_scroll: 0.0,
             sheet_search_rect: Rect::default(),
@@ -1223,7 +1328,7 @@ impl ArchiveApp {
             tag_focus: false,
             events_tx,
             events_rx,
-            proxy: Some(proxy),
+            proxy: wake,
             cursor_hand: false,
             last_error: None,
         };
@@ -1234,160 +1339,7 @@ impl ArchiveApp {
         Ok(app)
     }
 
-    /// A renderer-free instance used by layout tests and the selfcheck's
-    /// first phase. No worker threads are started.
-    pub fn headless(root: PathBuf, settings: Settings) -> Result<Self, String> {
-        let library = Arc::new(Library::open(root).map_err(|e| e.to_string())?);
-        let (events_tx, events_rx) = mpsc::channel();
-        let theme = archive_theme(false);
-        let mut ui = Ui::new(
-            crate::fonts::roboto(),
-            dream::ui::atlas::AtlasConfig::default(),
-        );
-        ui.set_theme(&theme);
-        let gate = AppGate::for_library(&library);
-        let mut app = Self {
-            renderer: None,
-            context: None,
-            ui: Some(ui),
-            theme,
-            dark: false,
-            system_dark: false,
-            settings,
-            library,
-            stats: Stats::default(),
-            collections: Vec::new(),
-            albums: Vec::new(),
-            cover_tiles: Vec::new(),
-            covers: HashMap::new(),
-            items: Vec::new(),
-            display: Vec::new(),
-            timeline_total: 0,
-            timeline_cursor: None,
-            track_tags: HashMap::new(),
-            timeline_done: true,
-            search_items: Vec::new(),
-            capture_index: None,
-            page: Page::Media,
-            media_resume: None,
-            select_mode: false,
-            selection: BTreeSet::new(),
-            last_selected: None,
-            scroll: 0.0,
-            scroll_target: 0.0,
-            scroll_max: 0.0,
-            scroll_drag: None,
-            grid: GridLayout::default(),
-            grid_key: (0, 0),
-            search: String::new(),
-            search_focus: false,
-            search_blink: 0.0,
-            search_open: Spring::at(0.0),
-            search_hover: false,
-            search_rect: Rect::default(),
-            search_debounce: 0.0,
-            search_wait: 0.0,
-            search_pending: false,
-            search_seq: 0,
-            search_inflight: None,
-            search_hits: None,
-            search_semantic_hits: None,
-            semantic: None,
-            press: None,
-            hover: None,
-            hover_anim: HashMap::new(),
-            check_anim: HashMap::new(),
-            empty_state: None,
-            empty_prev: None,
-            empty_t: 1.0,
-            empty_shown: false,
-            empty_drawn: false,
-            viewer: None,
-            viewer_retired: Vec::new(),
-            full_pending: None,
-            video_volume: 1.0,
-            video_muted: false,
-            full_failed: HashSet::new(),
-            modal: None,
-            modal_t: 0.0,
-            last_activity: Instant::now(),
-            vault_busy: false,
-            vault_thread: None,
-            sheet_scroll: 0.0,
-            sheet_search_rect: Rect::default(),
-            sheet_name_rect: Rect::default(),
-            sheet_plus_rect: Rect::default(),
-            sheet_cancel_rect: Rect::default(),
-            sheet_rect: Rect::default(),
-            sheet_search: Spring::at(0.0),
-            sheet_create: Spring::at(0.0),
-            toast: None,
-            menu: None,
-            menu_t: 0.0,
-            gate,
-            conversion: None,
-            menu_rect: Rect::default(),
-            thumbs: ThumbCache::new(16),
-            previews: ThumbCache::new(2),
-            texture_pool: None,
-            vault_epoch: 0,
-            viewer_textures: VecDeque::new(),
-            grid_textures: VecDeque::new(),
-            pruned_at: f32::NEG_INFINITY,
-            thumb_pending: HashSet::new(),
-            preview_pending: HashSet::new(),
-            preview_started: HashMap::new(),
-            thumb_failed: HashSet::new(),
-            preview_failed: HashMap::new(),
-            rebuilt: HashSet::new(),
-            screen: (1440.0, 900.0),
-            scale: 1.0,
-            input: Input::default(),
-            dirty: true,
-            last_frame: Instant::now(),
-            frame_real_dt: 0.0,
-            time: 0.0,
-            frame_dt: 0.0,
-            animating: false,
-            nav: Spring::at(0.0),
-            trash_notice: Spring::at(0.0),
-            opened: Spring::at(0.0),
-            open_title: String::new(),
-            open_row: 2,
-            details_open: [false; details::BLOCK_COUNT],
-            details_spring: [Spring::at(0.0); details::BLOCK_COUNT],
-            details_scroll: 0.0,
-            tag_item_id: None,
-            item_tags: Vec::new(),
-            tag_input: String::new(),
-            tag_suggestion: None,
-            tag_focus: false,
-            events_tx,
-            events_rx,
-            proxy: None,
-            cursor_hand: false,
-            last_error: None,
-        };
-        app.reload();
-        Ok(app)
-    }
-
     // --- Host plumbing ---------------------------------------------------
-
-    pub fn set_scale(&mut self, scale: f32) {
-        self.scale = scale.max(0.5);
-        if let Some(ui) = self.ui.as_mut() {
-            ui.set_scale(self.scale);
-        }
-    }
-
-    pub fn resize(&mut self, physical: (u32, u32)) {
-        self.screen = (
-            physical.0 as f32 / self.scale.max(1.0),
-            physical.1 as f32 / self.scale.max(1.0),
-        );
-        self.dirty = true;
-    }
 
     pub fn observe_theme(&mut self) {
         if self.settings.theme == ThemeChoice::System {
@@ -1396,6 +1348,9 @@ impl ArchiveApp {
     }
 
     pub fn set_system_dark(&mut self, dark: bool) {
+        if self.system_dark == dark {
+            return;
+        }
         self.system_dark = dark;
         self.observe_theme();
     }
@@ -1880,7 +1835,7 @@ impl ArchiveApp {
 
     fn pick_files(&mut self) {
         let tx = self.events_tx.clone();
-        let proxy = self.proxy.clone();
+        let wake = self.proxy.clone();
         std::thread::Builder::new()
             .name("forbiddenlibrary-picker".into())
             .spawn(move || {
@@ -1899,8 +1854,8 @@ impl ArchiveApp {
                     .unwrap_or_default();
                 if !files.is_empty() {
                     let _ = tx.send(AppEvent::Paths(files));
-                    if let Some(proxy) = proxy {
-                        let _ = proxy.send_event(());
+                    if let Some(wake) = wake {
+                        wake.wake();
                     }
                 }
             })
@@ -1946,7 +1901,7 @@ impl ArchiveApp {
             finished_at: None,
         }));
         self.modal_t = 0.0;
-        if let (Some(pool), Some(proxy)) = (self.texture_pool.as_ref(), self.proxy.clone()) {
+        if let (Some(pool), Some(wake)) = (self.texture_pool.as_ref(), self.proxy.clone()) {
             let _ = pool;
             worker::start_import(
                 Arc::clone(&self.library),
@@ -1954,7 +1909,7 @@ impl ArchiveApp {
                 cancel,
                 self.import_optimize(),
                 self.events_tx.clone(),
-                proxy,
+                wake,
                 staging,
             );
         }
@@ -2413,8 +2368,7 @@ impl ArchiveApp {
             matched_collections.extend(collections);
         }
 
-        let by_id: HashMap<i64, &Collection> =
-            self.collections.iter().map(|c| (c.id, c)).collect();
+        let by_id: HashMap<i64, &Collection> = self.collections.iter().map(|c| (c.id, c)).collect();
         let mut out: Vec<Collection> = Vec::new();
         for id in &tag_ranked {
             if let Some(c) = by_id.get(id) {
@@ -2915,13 +2869,8 @@ impl ArchiveApp {
             session.phase = ImportPhase::Removing;
             session.error = None;
         }
-        if let Some(proxy) = self.proxy.clone() {
-            worker::start_discard(
-                Arc::clone(&self.library),
-                ids,
-                self.events_tx.clone(),
-                proxy,
-            );
+        if let Some(wake) = self.proxy.clone() {
+            worker::start_discard(Arc::clone(&self.library), ids, self.events_tx.clone(), wake);
         }
         self.dirty = true;
     }
@@ -3141,17 +3090,6 @@ impl ArchiveApp {
         Some(self.last_frame + Duration::from_secs_f32(left.max(0.001)))
     }
 
-    /// Work that must happen even when no frame is drawn (the window is
-    /// minimised or covered): unlocked collections still lock on time.
-    pub fn idle_tick(&mut self, now: Instant) {
-        self.vault_idle_check(now);
-    }
-
-    /// The only wake a hidden window needs: the unlocked-collection timer.
-    pub fn hidden_wake(&self) -> Option<Instant> {
-        self.vault_wake()
-    }
-
     pub fn wants_frame(&self) -> bool {
         if self.dirty {
             return true;
@@ -3263,11 +3201,7 @@ impl ArchiveApp {
         if let Some(ui) = self.ui.as_mut() {
             ui.recycle_frame(frame);
         }
-        self.input.pressed = false;
-        self.input.released = false;
-        self.input.secondary_pressed = false;
-        self.input.wheel = 0.0;
-        self.input.precise = 0.0;
+        self.clear_input_edges();
     }
 
     pub fn build_frame(&mut self, dt: f32) -> UiFrame {
@@ -3297,6 +3231,164 @@ impl ArchiveApp {
         let frame = ui.end();
         self.ui = Some(ui);
         frame
+    }
+
+    /// One frame under Dream's app runner.
+    ///
+    /// The runner owns the window, the renderer and the UI, and calls this only
+    /// when a frame can have changed. The app replays that frame's input through
+    /// the event handlers it grew up with, advances its own state, draws, and
+    /// reports whether it still owes frames (an animation in flight, a texture
+    /// still uploading, a timer about to fire).
+    pub fn runner_frame(
+        &mut self,
+        ui: &mut Ui,
+        input: &UiInput,
+        scale: f32,
+        screen: (f32, f32),
+        now: Instant,
+    ) -> bool {
+        self.scale = scale.max(0.5);
+        self.screen = screen;
+        ui.set_scale(self.scale);
+        ui.set_theme(&self.theme);
+        self.pump_input(input);
+        self.frame_real_dt = now.saturating_duration_since(self.last_frame).as_secs_f32();
+        let dt = self.frame_real_dt.clamp(0.0, 0.05);
+        self.last_frame = now;
+        self.advance_viewer(now);
+        if let Some(auto_lock) = &self.auto_lock {
+            // A picture shown from a collection, or a lock already running,
+            // holds the countdown. The guard checks this when it expires.
+            auto_lock.hold(self.viewing_picture_in_collection() || self.vault_busy);
+        } else {
+            self.vault_idle_check(now);
+        }
+        self.animate(dt);
+        self.dirty = false;
+        self.draw(ui);
+        self.clear_input_edges();
+        // The pointer says what a press would do: a hand over anything
+        // clickable, a text caret over a field that takes typing.
+        ui.set_cursor(if self.cursor_hand {
+            UiCursor::Pointer
+        } else if self.text_focus() {
+            UiCursor::Text
+        } else {
+            UiCursor::Default
+        });
+        self.wants_frame()
+    }
+
+    /// Replays the runner's accumulated input through the app's event
+    /// handlers, in the order the old window loop would have seen it.
+    ///
+    /// The runner decodes keys into edges (arrows, Enter, Escape, Backspace,
+    /// typed text) and held modifiers; the app's own text fields and shortcuts
+    /// predate that, so the edges are turned back into the calls they always
+    /// made.
+    fn pump_input(&mut self, input: &UiInput) {
+        let nav = input.nav;
+        let active = input.mouse != self.input.mouse
+            || input.mouse_pressed
+            || input.mouse_released
+            || input.mouse_right_pressed
+            || input.wheel != 0.0
+            || input.wheel_precise != 0.0
+            || !input.text.is_empty()
+            || input.backspace > 0
+            || nav.up
+            || nav.down
+            || nav.left
+            || nav.right
+            || nav.confirm
+            || nav.cancel
+            || nav.delete
+            || nav.home
+            || nav.end
+            || nav.tab
+            || nav.page_up
+            || nav.page_down
+            || nav.select_all;
+        if active {
+            self.note_activity();
+        }
+        if input.mouse != self.input.mouse {
+            self.pointer_moved(input.mouse);
+        }
+        if input.mouse_pressed {
+            self.pointer_button(true);
+        }
+        if input.mouse_released {
+            self.pointer_button(false);
+        }
+        if input.mouse_right_pressed {
+            self.pointer_secondary();
+        }
+        if input.wheel != 0.0 || input.wheel_precise != 0.0 {
+            self.wheel(input.wheel, input.wheel_precise);
+        }
+        self.modifiers(nav.word, nav.shift);
+        if !input.text.is_empty() {
+            // Typed text goes to whichever field has focus. A bare character
+            // with no field focused is a shortcut (space plays, m mutes and so
+            // on); the key handler ignores it when a field would take it.
+            self.text_input(&input.text);
+            for ch in input.text.chars().filter(|ch| !ch.is_control()) {
+                self.key(dream::ui::widgets::Key::Char(ch), true);
+            }
+        }
+        for _ in 0..input.backspace {
+            self.key(dream::ui::widgets::Key::Backspace, true);
+        }
+        for (pressed, key) in [
+            (nav.up, dream::ui::widgets::Key::Up),
+            (nav.down, dream::ui::widgets::Key::Down),
+            (nav.left, dream::ui::widgets::Key::Left),
+            (nav.right, dream::ui::widgets::Key::Right),
+            (nav.confirm, dream::ui::widgets::Key::Enter),
+            (nav.cancel, dream::ui::widgets::Key::Escape),
+            (nav.delete, dream::ui::widgets::Key::Delete),
+            (nav.home, dream::ui::widgets::Key::Home),
+            (nav.end, dream::ui::widgets::Key::End),
+            (nav.tab, dream::ui::widgets::Key::Tab),
+            (nav.page_up, dream::ui::widgets::Key::PageUp),
+            (nav.page_down, dream::ui::widgets::Key::PageDown),
+        ] {
+            if pressed {
+                self.key(key, true);
+            }
+        }
+        // Ctrl+A is the one editing chord the runner decodes for its widgets.
+        if nav.select_all {
+            self.key(dream::ui::widgets::Key::Char('a'), true);
+        }
+    }
+
+    /// Whether typed text would land in one of the app's own fields right now.
+    fn text_focus(&self) -> bool {
+        if self.gate.is_some() || self.search_focus || self.tag_focus {
+            return true;
+        }
+        match &self.modal {
+            Some(Modal::AddToCollection { focus, .. }) => *focus != SheetField::Idle,
+            Some(
+                Modal::Password(_)
+                | Modal::AppPassword(_)
+                | Modal::Rename { .. }
+                | Modal::TagCollection { .. },
+            ) => true,
+            _ => false,
+        }
+    }
+
+    /// Each frame consumes the edges; held state carries over.
+    fn clear_input_edges(&mut self) {
+        self.input.pressed = false;
+        self.input.released = false;
+        self.input.secondary_pressed = false;
+        self.input.wheel = 0.0;
+        self.input.precise = 0.0;
     }
 
     // --- Interaction helpers --------------------------------------------
@@ -3866,7 +3958,7 @@ impl ArchiveApp {
     ) {
         let library = Arc::clone(&self.library);
         let events = self.events_tx.clone();
-        let proxy = self.proxy.clone();
+        let wake = self.proxy.clone();
         std::thread::spawn(move || {
             let mut current = current;
             let mut new_password = new_password;
@@ -3920,8 +4012,8 @@ impl ArchiveApp {
                 kind,
                 result,
             }));
-            if let Some(proxy) = proxy {
-                let _ = proxy.send_event(());
+            if let Some(wake) = wake {
+                wake.wake();
             }
         });
     }
@@ -4009,7 +4101,12 @@ impl ArchiveApp {
         ui.rect(Rect::new(0.0, 0.0, width, height), self.theme.bg);
         let card_w = 380.0_f32.min(width - 32.0);
         let card_h = 228.0;
-        let card = Rect::new((width - card_w) * 0.5, (height - card_h) * 0.5, card_w, card_h);
+        let card = Rect::new(
+            (width - card_w) * 0.5,
+            (height - card_h) * 0.5,
+            card_w,
+            card_h,
+        );
         ui.paint_round_rect(card, 16.0, self.theme.g1);
         ui.paint_round_ring(card, 16.0, 1.25, self.modal_outline());
         self.label_center(
@@ -5056,6 +5153,9 @@ impl ArchiveApp {
     /// timer that locks unlocked collections.
     pub fn note_activity(&mut self) {
         self.last_activity = Instant::now();
+        if let Some(auto_lock) = &self.auto_lock {
+            auto_lock.touch();
+        }
     }
 
     /// Whether the page on screen is a collection that is unlocked right now.
@@ -5127,7 +5227,7 @@ impl ArchiveApp {
         }
         let library = Arc::clone(&self.library);
         let events = self.events_tx.clone();
-        let proxy = self.proxy.clone();
+        let wake = self.proxy.clone();
         self.vault_thread = Some(std::thread::spawn(move || {
             let mut password = password;
             let typed = password.as_deref().unwrap_or("");
@@ -5151,8 +5251,8 @@ impl ArchiveApp {
                 kind,
                 result,
             }));
-            if let Some(proxy) = proxy {
-                let _ = proxy.send_event(());
+            if let Some(wake) = wake {
+                wake.wake();
             }
         }));
     }
@@ -7167,10 +7267,10 @@ impl ArchiveApp {
     /// Called from a player's thread when it has something new. The closure
     /// pokes the event loop so the next frame polls the player.
     fn wake(&self) -> Wake {
-        let proxy = self.proxy.clone();
+        let wake = self.proxy.clone();
         Arc::new(move || {
-            if let Some(proxy) = &proxy {
-                let _ = proxy.send_event(());
+            if let Some(wake) = &wake {
+                wake.wake();
             }
         })
     }
@@ -7654,7 +7754,14 @@ impl ArchiveApp {
     /// the earliest of the players' own schedules, the full decode's
     /// debounce, and the video bar's auto-hide.
     pub fn next_wake(&self, now: Instant) -> Option<Instant> {
-        [self.vault_wake(), self.viewer_wake(now), self.caret_wake()]
+        // The auto-lock guard thread owns the vault countdown; asking the
+        // frame loop for it as well would only wake it to do nothing.
+        let vault = self
+            .auto_lock
+            .is_none()
+            .then(|| self.vault_wake())
+            .flatten();
+        [vault, self.viewer_wake(now), self.caret_wake()]
             .into_iter()
             .flatten()
             .min()
@@ -8618,7 +8725,12 @@ impl ArchiveApp {
 
     fn add_tag_to_current_item(&mut self) {
         let tag = self.tag_input.trim().to_string();
-        let Some(id) = self.viewer.as_ref().and_then(|v| v.ids.get(v.index)).cloned() else {
+        let Some(id) = self
+            .viewer
+            .as_ref()
+            .and_then(|v| v.ids.get(v.index))
+            .cloned()
+        else {
             return;
         };
         if tag.is_empty() {
@@ -8639,7 +8751,12 @@ impl ArchiveApp {
     }
 
     fn remove_tag_from_current_item(&mut self, tag: &str) {
-        let Some(id) = self.viewer.as_ref().and_then(|v| v.ids.get(v.index)).cloned() else {
+        let Some(id) = self
+            .viewer
+            .as_ref()
+            .and_then(|v| v.ids.get(v.index))
+            .cloned()
+        else {
             return;
         };
         match self.library.remove_item_tag(&id, tag) {
@@ -8696,7 +8813,9 @@ impl ArchiveApp {
             let suffix = suggestion
                 .filter(|s| s.starts_with(text) && s.len() > text.len())
                 .map(|s| &s[text.len()..]);
-            let suffix_w = suffix.map(|s| ui.measure(s, font, font_size).0).unwrap_or(0.0);
+            let suffix_w = suffix
+                .map(|s| ui.measure(s, font, font_size).0)
+                .unwrap_or(0.0);
             let total_w = typed_w + suffix_w;
             let shift = (typed_w - avail).max(0.0);
 
@@ -8761,7 +8880,8 @@ impl ArchiveApp {
 
         // Lay out tag pills ahead of time so the Tags card height is exact.
         let font = ui.fonts().resolve(FontWeight::Regular, false);
-        let mut pill_layouts: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(self.item_tags.len());
+        let mut pill_layouts: Vec<(usize, f32, f32, f32)> =
+            Vec::with_capacity(self.item_tags.len());
         let mut px = 0.0_f32;
         let mut py = 0.0_f32;
         let pill_h = 24.0;
@@ -8782,10 +8902,7 @@ impl ArchiveApp {
             py + pill_h
         };
         let tags_card_h = if item.is_some() {
-            CARD_HEAD_H
-                + 34.0
-                + if pills_h > 0.0 { 10.0 + pills_h } else { 0.0 }
-                + 14.0
+            CARD_HEAD_H + 34.0 + if pills_h > 0.0 { 10.0 + pills_h } else { 0.0 } + 14.0
         } else {
             0.0
         };
@@ -8862,7 +8979,9 @@ impl ArchiveApp {
                 13.0,
                 info,
             );
-            if interactive && list.contains(self.input.mouse) && input_rect.contains(self.input.mouse)
+            if interactive
+                && list.contains(self.input.mouse)
+                && input_rect.contains(self.input.mouse)
             {
                 self.cursor_hand = true;
                 if self.input.pressed {
@@ -9318,12 +9437,12 @@ impl ArchiveApp {
                 self.pick_files();
             }
             if self.draw_import_tile(ui, right, AppIcon::Smartphone, "Wireless Transfer") {
-                let proxy = self.proxy.clone();
+                let wake = self.proxy.clone();
                 let tx = self.events_tx.clone();
                 match crate::remote_import::Session::start(move || {
                     let _ = tx.send(AppEvent::RemoteImportChanged);
-                    if let Some(proxy) = &proxy {
-                        let _ = proxy.send_event(());
+                    if let Some(wake) = &wake {
+                        wake.wake();
                     }
                 }) {
                     Ok(session) => self.modal = Some(Modal::RemoteImport(session)),
@@ -10911,6 +11030,7 @@ mod tests {
     };
     use crate::settings::Settings;
     use archive_core::{Collection, LockState, TimelineFilter};
+    use dream::ui::widgets::{NavInput, Ui, UiInput};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -12848,7 +12968,8 @@ mod tests {
         assert!(app.display.is_empty());
 
         // When semantic results are merged, tag matches come first without duplicates.
-        let merged = app.merge_tag_search("Food", &[ids[0].clone(), ids[2].clone(), ids[1].clone()]);
+        let merged =
+            app.merge_tag_search("Food", &[ids[0].clone(), ids[2].clone(), ids[1].clone()]);
         assert_eq!(merged, vec![ids[2].clone(), ids[0].clone(), ids[1].clone()]);
     }
 
@@ -12858,7 +12979,9 @@ mod tests {
         let meals = app.library.create_collection("Meals").unwrap();
         let snacks = app.library.create_collection("Snacks").unwrap();
         app.library.add_to_collection(meals, &ids).unwrap();
-        app.library.add_to_collection(snacks, &[ids[0].clone()]).unwrap();
+        app.library
+            .add_to_collection(snacks, &[ids[0].clone()])
+            .unwrap();
         app.library.add_item_tag(&ids[0], "Breakfast").unwrap();
         app.reload();
 
@@ -12883,7 +13006,12 @@ mod tests {
 
         // Submitting adds "Breakfast" to Meals itself, without touching child item ids[1].
         app.confirm_modal();
-        assert!(!app.library.item_tags(&ids[1]).unwrap().contains(&"Breakfast".to_string()));
+        assert!(
+            !app.library
+                .item_tags(&ids[1])
+                .unwrap()
+                .contains(&"Breakfast".to_string())
+        );
         assert!(matches!(
             &app.modal,
             Some(Modal::TagCollection { input, tags, .. }) if input.is_empty() && tags == &vec!["Breakfast".to_string()]
@@ -12893,7 +13021,10 @@ mod tests {
         app.text_input("Br");
         assert!(matches!(
             &app.modal,
-            Some(Modal::TagCollection { suggestion: None, .. })
+            Some(Modal::TagCollection {
+                suggestion: None,
+                ..
+            })
         ));
         app.modal = None;
 
@@ -12912,10 +13043,79 @@ mod tests {
         // Removing the tag from Meals does not remove it from child item ids[0].
         app.ask_tag_collection(meals);
         app.remove_tag_from_collection_modal(meals, "Breakfast");
-        assert!(app.library.item_tags(&ids[0]).unwrap().contains(&"Breakfast".to_string()));
+        assert!(
+            app.library
+                .item_tags(&ids[0])
+                .unwrap()
+                .contains(&"Breakfast".to_string())
+        );
         assert!(matches!(
             &app.modal,
             Some(Modal::TagCollection { tags, .. }) if tags.is_empty()
         ));
+    }
+
+    /// Drives one frame the way Dream's runner does: begin the UI with the
+    /// frame's input, hand the app that same input, and close the frame.
+    fn runner_frame(app: &mut ArchiveApp, ui: &mut Ui, input: UiInput) {
+        let (width, height) = app.screen;
+        ui.begin(input.clone(), (width, height));
+        app.runner_frame(ui, &input, app.scale, app.screen, Instant::now());
+        let frame = ui.end();
+        ui.recycle_frame(frame);
+    }
+
+    #[test]
+    fn runner_input_types_and_cancels_in_the_search_field() {
+        let (_temp, mut app, _ids) = app_with_photos(2);
+        let mut ui = app.ui.take().expect("the headless app owns its UI");
+        app.search_focus = true;
+        runner_frame(
+            &mut app,
+            &mut ui,
+            UiInput {
+                text: "photo".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(app.search, "photo");
+
+        runner_frame(
+            &mut app,
+            &mut ui,
+            UiInput {
+                nav: NavInput {
+                    cancel: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(!app.search_focus, "Escape leaves the field");
+        assert!(app.search.is_empty(), "Escape clears the search");
+        app.ui = Some(ui);
+    }
+
+    #[test]
+    fn runner_characters_reach_the_viewer_as_shortcuts() {
+        let (_temp, mut app, _ids) = app_with_photos(2);
+        let mut ui = app.ui.take().expect("the headless app owns its UI");
+        app.open_viewer(0);
+        let info = app.viewer.as_ref().expect("the viewer opened").info_open;
+        runner_frame(
+            &mut app,
+            &mut ui,
+            UiInput {
+                text: "i".into(),
+                ..Default::default()
+            },
+        );
+        assert_ne!(
+            app.viewer.as_ref().expect("the viewer stayed").info_open,
+            info,
+            "a bare character is a viewer shortcut"
+        );
+        app.close_viewer();
+        app.ui = Some(ui);
     }
 }

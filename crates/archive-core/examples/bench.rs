@@ -22,9 +22,14 @@ const SCAN_ITEMS: usize = 120_000;
 const SCAN_DIMS: usize = archive_core::EMBED_DIMS;
 
 fn main() {
-    if std::env::var_os("FORBIDDEN_LIBRARY_FFMPEG_DIR").is_none()
-        && Path::new("assets/ffmpeg/ffmpeg.exe").is_file()
-    {
+    // A downloaded bundled build, when this checkout has one. Otherwise the
+    // engine finds the system ffmpeg on PATH.
+    let bundled = if cfg!(windows) {
+        "assets/ffmpeg/ffmpeg.exe"
+    } else {
+        "assets/ffmpeg/ffmpeg"
+    };
+    if std::env::var_os("FORBIDDEN_LIBRARY_FFMPEG_DIR").is_none() && Path::new(bundled).is_file() {
         // SAFETY: set before any worker thread reads the environment.
         unsafe {
             std::env::set_var("FORBIDDEN_LIBRARY_FFMPEG_DIR", "assets/ffmpeg");
